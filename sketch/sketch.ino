@@ -171,6 +171,13 @@ void handleFlow() {
   if (flowState == FLOW_IDLE) {
     if (autoLoopEnabled) {
       startFlow("auto");
+      return;
+    }
+
+    // Auch ohne Automatik den Bildschirm wachhalten
+    if (timeReached(nextJiggleAt)) {
+      jiggleOnce();
+      nextJiggleAt = millis() + JIGGLE_INTERVAL;
     }
     return;
   }
@@ -863,6 +870,7 @@ void setup() {
     delay(1000);
     Server.handleClient();
   }
+  nextJiggleAt = millis() + JIGGLE_INTERVAL;
   Serial.println("Bereit.");
 }
 
