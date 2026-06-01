@@ -29,7 +29,7 @@ const uint32_t WIFI_CONNECT_MS    = 15000;
 const int8_t   MANUAL_MOUSE_STEP  = 20;
 const char*    NTP_SERVER1        = "pool.ntp.org";
 const char*    NTP_SERVER2        = "time.nist.gov";
-const char*    TZ_INFO            = "CET-1CEST,M3.5.0,M10.5.0/3";  // Mitteleuropa inkl. Sommerzeit
+const char*    TZ_INFO            = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europe/Vienna (MEZ/MESZ inkl. Sommerzeit)
 const uint8_t  MAX_SCHEDULES      = 8;
 const uint32_t TIME_RETRY_MS      = 60000;          // erneuter Sync-Versuch
 const int32_t  SCHEDULE_GRACE_S   = 3600;           // verpasste Auslösung noch bis 1 h spaeter nachholen
@@ -964,6 +964,8 @@ String indexHtml() {
             <p><code>GET /api/status</code> Status lesen.</p>
             <p><code>POST /api/settings?auto=1</code> Auto ein.</p>
             <p><code>POST /api/settings?auto=0</code> Auto aus.</p>
+            <p><code>POST /api/schedule?when=2026-06-01T14:30</code> Auslösung planen.</p>
+            <p><code>POST /api/schedule/delete?when=EPOCH</code> Auslösung löschen.</p>
           </div>
         </section>
       </div>
@@ -1047,6 +1049,12 @@ String indexHtml() {
       return serverEpoch * 1000 + (Date.now() - fetchedAt);
     }
 
+    function fmtStamp(epochSec) {
+      const d = new Date(epochSec * 1000);
+      return WEEKDAYS[d.getDay()].slice(0, 2) + ', ' + d.getDate() + '. ' + MONTHS[d.getMonth()] +
+             ' ' + d.getFullYear() + ', ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ' Uhr';
+    }
+
     function fmtDuration(ms) {
       if (ms < 0) ms = 0;
       let s = Math.floor(ms / 1000);
@@ -1060,9 +1068,18 @@ String indexHtml() {
     }
 
     function tick() {
-      const d = new Date(nowEpochMs());
-      document.getElementById('clockTime').textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
-      document.getElementById('clockDate').textContent = WEEKDAYS[d.getDay()] + ', ' + d.getDate() + '. ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+      const clockTime = document.getElementById('clockTime');
+      const clockDate = document.getElementById('clockDate');
+
+      if (!timeSynced) {
+        clockTime.textContent = '--:--:--';
+        clockDate.textContent = '– – –';
+      } else {
+        const d = new Date(nowEpochMs());
+        clockTime.textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+        clockDate.textContent = WEEKDAYS[d.getDay()] + ', ' + d.getDate() + '. ' + MONTHS[d.getMonth()] + ' ' + d.getFullYear();
+      }
+
       renderSchedules();
       renderNextTrigger();
     }
@@ -1089,7 +1106,7 @@ String indexHtml() {
       const now = nowEpochMs();
       list.innerHTML = sorted.map(s =>
         '<li class="schedule-item">' +
-          '<span class="schedule-when">' + s.label + '</span>' +
+          '<span class="schedule-when">' + fmtStamp(s.when) + '</span>' +
           '<span class="schedule-count">in ' + fmtDuration(s.when * 1000 - now) + '</span>' +
           '<button type="button" onclick="deleteSchedule(' + s.when + ')">Löschen</button>' +
         '</li>'

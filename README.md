@@ -12,8 +12,12 @@ ESP32-S3/Arduino-Sketch fuer eine USB-HID Maus- und Tastatursteuerung mit lokale
 - Lokale, mobilfreundliche Website ohne externe JS-/CSS-Abhaengigkeiten
 - Flow per Website oder API ausloesen
 - Automatische Schleife ein- und ausschaltbar
+- Geplante Einmal-Auslösungen zu festen Zeitpunkten (persistent gespeichert)
+- Zeitsynchronisation per NTP beim Start (Zeitzone Mitteleuropa, inkl. Sommerzeit)
+- Live-Statusanzeige mit Gerätezeit, Flow-Zustand und Countdown zur nächsten Auslösung
 - Manuelle Maussteuerung per Pfeiltasten auf der Website
 - Manueller Linksklick per Website oder API
+- Bildschirm-Wachhalten auch im Leerlauf (Maus wackelt alle 10 s leicht)
 
 ## Ablauf
 
@@ -32,6 +36,12 @@ Der Flow macht:
 5. `Strg + Alt + F`
 
 Wenn die automatische Schleife aktiv ist, wartet der Sketch nach jedem Flow zufaellig 25 bis 35 Minuten und startet dann erneut. Im Standby bewegt sich die Maus regelmaessig ca. 1 cm nach links und wieder zurueck, damit sichtbar ist, dass der Sketch noch laeuft.
+
+Auch im Leerlauf (Automatik aus) wackelt die Maus alle 10 Sekunden leicht hin und her, damit der Bildschirm nicht in den Energiesparmodus wechselt.
+
+## Geplante Auslösung
+
+Auf der Website lassen sich unter „Geplante Auslösung" feste Zeitpunkte festlegen, an denen der Flow einmalig automatisch startet (bis zu 8 Einträge). Voraussetzung ist eine synchronisierte Gerätezeit – diese wird beim Start per NTP geholt, sobald eine Heimnetz-Verbindung besteht. Die Zeitpunkte werden persistent gespeichert und nach einer Auslösung automatisch entfernt. Verpasste Zeitpunkte (z. B. weil das Geraet aus war) werden bis zu eine Stunde spaeter nachgeholt, danach verfallen sie.
 
 ## Weboberflaeche
 
@@ -88,6 +98,20 @@ Automatische Schleife ausschalten:
 ```http
 POST /api/settings?auto=0
 ```
+
+Geplante Auslösung hinzufügen (lokale Gerätezeit, Format `YYYY-MM-DDTHH:MM`):
+
+```http
+POST /api/schedule?when=2026-06-01T14:30
+```
+
+Geplante Auslösung löschen (Epoch-Zeit wie in `/api/status` geliefert):
+
+```http
+POST /api/schedule/delete?when=1780000000
+```
+
+Das Statusobjekt aus `GET /api/status` enthaelt zusaetzlich `time` (Epoch), `timeSynced`, `maxSchedules` und die Liste `schedules` mit `when` und `label`.
 
 ## Wichtige Hinweise
 
