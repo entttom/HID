@@ -140,4 +140,4 @@ pio run -e lilygo-t-dongle-s3
 pio run -e lilygo-t-dongle-s3 -t upload
 ```
 
-Die Projektkonfiguration nutzt ein lokales Boardprofil `lilygo-t-dongle-s3-hid` und konfiguriert `TFT_eSPI` fuer das integrierte 80 x 160 ST7735-SPI-Display des LilyGO T-Dongle-S3. In der Arduino IDE funktioniert der Sketch ebenfalls, wenn ein ESP32-S3-Board mit TinyUSB/HID und eine passend konfigurierte `TFT_eSPI`-Installation fuer das LilyGO T-Dongle-S3 verwendet wird.
+Die Projektkonfiguration nutzt ein lokales Boardprofil `lilygo-t-dongle-s3-hid`. Das integrierte 80 x 160 ST7735-SPI-Display des LilyGO T-Dongle-S3 wird direkt im Sketch ueber `Adafruit GFX Library` und `Adafruit ST7735 and ST7789 Library` konfiguriert. In der Arduino IDE muessen diese beiden Bibliotheken ueber den Library Manager installiert sein; eine manuelle Aenderung globaler Display-Konfigurationsdateien ist nicht noetig.

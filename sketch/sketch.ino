@@ -3,15 +3,50 @@
 #include <USBHIDMouse.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
-#include <TFT_eSPI.h>
+#include <string.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
 
 USBHIDKeyboard Keyboard;
 USBHIDMouse    Mouse;
 WebServer      Server(80);
 Preferences    Settings;
-TFT_eSPI Display = TFT_eSPI();
+
+static constexpr int DISPLAY_MOSI = 3;
+static constexpr int DISPLAY_SCLK = 5;
+static constexpr int DISPLAY_CS   = 4;
+static constexpr int DISPLAY_DC   = 2;
+static constexpr int DISPLAY_RST  = 1;
+static constexpr int DISPLAY_BL   = 38;
+
+SPIClass DisplaySPI(FSPI);
+Adafruit_ST7735 Display(&DisplaySPI, DISPLAY_CS, DISPLAY_DC, DISPLAY_RST);
+
+#ifdef INITR_MINI160x80_PLUGIN
+static constexpr uint8_t DISPLAY_INITR = INITR_MINI160x80_PLUGIN;
+#else
+static constexpr uint8_t DISPLAY_INITR = INITR_MINI160x80;
+#endif
+
+static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+static constexpr uint16_t COLOR_BLACK     = ST77XX_BLACK;
+static constexpr uint16_t COLOR_WHITE     = ST77XX_WHITE;
+static constexpr uint16_t COLOR_RED       = ST77XX_RED;
+static constexpr uint16_t COLOR_GREEN     = ST77XX_GREEN;
+static constexpr uint16_t COLOR_BLUE      = ST77XX_BLUE;
+static constexpr uint16_t COLOR_YELLOW    = ST77XX_YELLOW;
+static constexpr uint16_t COLOR_CYAN      = ST77XX_CYAN;
+static constexpr uint16_t COLOR_ORANGE    = rgb565(255, 165, 0);
+static constexpr uint16_t COLOR_DARKGREY  = rgb565(128, 128, 128);
+static constexpr uint16_t COLOR_LIGHTGREY = rgb565(192, 192, 192);
 
 // --- Konfiguration ---
 const uint32_t CLICK_DELAY_MS     = 50;
@@ -28,6 +63,11 @@ const uint16_t START_RECT_DELAY   = 50;            // ms pro Schritt
 const char*    AP_SSID            = "HID-Setup";
 const char*    AP_PASSWORD        = "hidsetup123";
 const uint32_t WIFI_CONNECT_MS    = 15000;
+const uint32_t WIFI_RETRY_MS      = 30000;          // Reconnect-Versuch im Hintergrund
+const uint32_t LONG_PRESS_MS      = 800;            // Tastendruck ab hier = Aktion statt Blaettern
+const uint32_t SSE_INTERVAL_MS    = 1000;           // Push-Takt fuer Live-Status
+const uint8_t  SSE_MAX_CLIENTS    = 3;
+const char*    OTA_HOSTNAME       = "hid-dongle";
 const int8_t   MANUAL_MOUSE_STEP  = 20;
 const char*    NTP_SERVER1        = "pool.ntp.org";
 const char*    NTP_SERVER2        = "time.nist.gov";
@@ -37,22 +77,9 @@ const uint32_t TIME_RETRY_MS      = 60000;          // erneuter Sync-Versuch
 const int32_t  SCHEDULE_GRACE_S   = 3600;           // verpasste Auslösung noch bis 1 h spaeter nachholen
 const uint32_t DISPLAY_REFRESH_MS = 1000;
 const uint32_t DISPLAY_PAGE_MS    = 5000;
-const uint32_t DISPLAY_START_DELAY_MS = 10000;
 const uint32_t BUTTON_DEBOUNCE_MS = 220;
-const uint8_t  DISPLAY_PAGE_COUNT = 2;
+const uint8_t  DISPLAY_PAGE_COUNT = 2;  // Basisseiten; +1 wenn Aktivitaeten existieren
 const uint8_t  DISPLAY_BUTTON_A   = 0;
-
-#ifndef PIN_POWER_ON
-#define PIN_POWER_ON -1
-#endif
-
-#ifndef TFT_BL
-#define TFT_BL 38
-#endif
-
-#ifndef TFT_BACKLIGHT_ON
-#define TFT_BACKLIGHT_ON HIGH
-#endif
 
 enum FlowState {
   FLOW_IDLE,
@@ -84,7 +111,14 @@ uint32_t lastDisplayButtonAt = 0;
 uint8_t displayPage = 0;
 bool displayDirty = true;
 bool displayButtonWasPressed = false;
+bool displayButtonLongFired = false;
+uint32_t displayButtonDownAt = 0;
 bool displayReady = false;
+uint32_t nextWifiRetryAt = 0;
+bool wifiWasConnected = false;
+bool otaStarted = false;
+WiFiClient sseClients[SSE_MAX_CLIENTS];
+uint32_t nextSseAt = 0;
 volatile UsbRuntimeState usbRuntimeState = USB_WAITING;
 volatile bool usbWasMounted = false;
 
@@ -199,9 +233,9 @@ String hidStatusLabel() {
 }
 
 uint16_t hidStatusColor() {
-  if (hidActive()) return TFT_GREEN;
-  if (usbRuntimeState == USB_SUSPENDED) return TFT_ORANGE;
-  return TFT_RED;
+  if (hidActive()) return COLOR_GREEN;
+  if (usbRuntimeState == USB_SUSPENDED) return COLOR_ORANGE;
+  return COLOR_RED;
 }
 
 String durationLabelMs(uint64_t ms) {
@@ -226,6 +260,17 @@ time_t nextScheduleTime() {
     if (next == 0 || schedules[i] < next) next = schedules[i];
   }
   return next;
+}
+
+bool hasActivities() {
+  if (autoLoopEnabled) return true;
+  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT ||
+      flowState == FLOW_AUTO_STANDBY) return true;
+  return nextScheduleTime() != 0;
+}
+
+uint8_t displayPageCount() {
+  return hasActivities() ? DISPLAY_PAGE_COUNT + 1 : DISPLAY_PAGE_COUNT;
 }
 
 String nextTriggerLabel() {
@@ -253,11 +298,15 @@ String nextTriggerLabel() {
 
 void drawPageIndicator() {
   const int16_t x = Display.width() - 6;
-  const int16_t half = Display.height() / 2;
-  uint16_t inactive = TFT_DARKGREY;
+  const int16_t h = Display.height();
+  uint16_t inactive = COLOR_DARKGREY;
+  uint8_t pages = displayPageCount();
 
-  Display.fillRect(x, 0, 6, half - 1, displayPage == 0 ? TFT_YELLOW : inactive);
-  Display.fillRect(x, half + 1, 6, Display.height() - half - 1, displayPage == 1 ? TFT_YELLOW : inactive);
+  for (uint8_t i = 0; i < pages; i++) {
+    int16_t top = (int32_t)h * i / pages;
+    int16_t bottom = (int32_t)h * (i + 1) / pages;
+    Display.fillRect(x, top, 6, (bottom - top) - 1, displayPage == i ? COLOR_YELLOW : inactive);
+  }
 }
 
 String fitDisplayText(const String& value, uint8_t maxChars = 18) {
@@ -265,81 +314,152 @@ String fitDisplayText(const String& value, uint8_t maxChars = 18) {
   return value.substring(0, maxChars - 3) + "...";
 }
 
-void drawLabelValue(int16_t y, const String& label, const String& value, uint16_t valueColor = TFT_WHITE) {
-  Display.setTextFont(1);
-  Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+void drawLabelValue(int16_t y, const String& label, const String& value, uint16_t valueColor = COLOR_WHITE) {
+  Display.setTextSize(1);
+  Display.setTextColor(COLOR_LIGHTGREY, COLOR_BLACK);
   Display.setCursor(4, y);
   Display.print(label);
-  Display.setTextColor(valueColor, TFT_BLACK);
+  Display.setTextColor(valueColor, COLOR_BLACK);
   Display.setCursor(48, y);
   Display.print(fitDisplayText(value, 17));
 }
 
 void drawDisplayHeader(const char* title) {
-  Display.fillScreen(TFT_BLACK);
-  Display.setTextFont(2);
-  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.fillScreen(COLOR_BLACK);
+  Display.setTextSize(2);
+  Display.setTextColor(COLOR_WHITE, COLOR_BLACK);
   Display.setCursor(4, 1);
   Display.print(title);
-  Display.drawFastHLine(4, 20, Display.width() - 16, TFT_DARKGREY);
+  Display.drawFastHLine(4, 20, Display.width() - 16, COLOR_DARKGREY);
   drawPageIndicator();
 }
 
 void drawNetworkPage() {
   drawDisplayHeader("Netz");
 
-  Display.setTextColor(TFT_CYAN, TFT_BLACK);
-  Display.setTextFont(1);
-  Display.setCursor(4, 24);
-  Display.print("AP");
-  Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  Display.setTextFont(4);
-  Display.setCursor(4, 36);
-  Display.print(WiFi.softAPIP().toString());
+  bool wifiConnected = WiFi.status() == WL_CONNECTED;
 
-  drawLabelValue(66, "WLAN", displayWifiIp(), WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_ORANGE);
+  // Primaere (grosse) Adresse: WLAN sobald verbunden, sonst AP.
+  const char* primaryLabel = wifiConnected ? "WLAN" : "AP";
+  String primaryIp = wifiConnected ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+
+  Display.setTextColor(COLOR_CYAN, COLOR_BLACK);
+  Display.setTextSize(1);
+  Display.setCursor(4, 24);
+  Display.print(primaryLabel);
+  Display.setTextColor(wifiConnected ? COLOR_GREEN : COLOR_WHITE, COLOR_BLACK);
+  Display.setTextSize(2);
+  Display.setCursor(4, 36);
+  Display.print(primaryIp);
+
+  // Sekundaere (kleine) Adresse: AP wenn WLAN gross ist, sonst WLAN-Status.
+  if (wifiConnected) {
+    drawLabelValue(66, "AP", WiFi.softAPIP().toString(), COLOR_LIGHTGREY);
+  } else {
+    drawLabelValue(66, "WLAN", displayWifiIp(), COLOR_ORANGE);
+  }
 }
 
 void drawStatusPage() {
   drawDisplayHeader("Status");
 
   drawLabelValue(24, "HID", hidStatusLabel(), hidStatusColor());
-  drawLabelValue(38, "Mode", modeLabel(), autoLoopEnabled ? TFT_GREEN : TFT_WHITE);
-  drawLabelValue(52, "Flow", flowStateDisplayName(), flowState == FLOW_IDLE ? TFT_WHITE : TFT_ORANGE);
-  drawLabelValue(66, "Next", nextTriggerLabel(), TFT_CYAN);
+  drawLabelValue(38, "Mode", modeLabel(), autoLoopEnabled ? COLOR_GREEN : COLOR_WHITE);
+  drawLabelValue(52, "Flow", flowStateDisplayName(), flowState == FLOW_IDLE ? COLOR_WHITE : COLOR_ORANGE);
+  drawLabelValue(66, "Next", nextTriggerLabel(), COLOR_CYAN);
+}
+
+void drawActivityPage() {
+  drawDisplayHeader("Plan");
+
+  // "Next" gross, mit dem ganzen verfuegbaren Platz.
+  Display.setTextColor(COLOR_CYAN, COLOR_BLACK);
+  Display.setTextSize(1);
+  Display.setCursor(4, 24);
+  Display.print("Next");
+  Display.setTextColor(COLOR_WHITE, COLOR_BLACK);
+  Display.setTextSize(2);
+  Display.setCursor(4, 36);
+  Display.print(fitDisplayText(nextTriggerLabel(), 12));
+
+  // Bis zu zwei kommende Planzeiten auflisten.
+  time_t now = timeSynced ? time(nullptr) : 0;
+  int16_t y = 60;
+  uint8_t shown = 0;
+  for (uint8_t i = 0; i < MAX_SCHEDULES && shown < 2; i++) {
+    if (schedules[i] == 0) continue;
+    if (now != 0 && schedules[i] < now) continue;
+    drawLabelValue(y, shown == 0 ? "Plan" : "", formatTime(schedules[i]), COLOR_LIGHTGREY);
+    y += 12;
+    shown++;
+  }
+  if (shown == 0) {
+    drawLabelValue(60, "Plan", autoLoopEnabled ? "Automatik" : "keiner", COLOR_DARKGREY);
+  }
+}
+
+void drawBootPage(const char* message) {
+  Display.fillScreen(COLOR_BLACK);
+  Display.setTextSize(2);
+  Display.setTextColor(COLOR_WHITE, COLOR_BLACK);
+  Display.setCursor(4, 8);
+  Display.print("HID");
+  Display.setTextSize(1);
+  Display.setTextColor(COLOR_CYAN, COLOR_BLACK);
+  Display.setCursor(4, 34);
+  Display.print(message);
 }
 
 void setupDisplay() {
-  if (PIN_POWER_ON >= 0) {
-    pinMode(PIN_POWER_ON, OUTPUT);
-    digitalWrite(PIN_POWER_ON, HIGH);
-  }
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+  pinMode(DISPLAY_BL, OUTPUT);
+  digitalWrite(DISPLAY_BL, LOW);
+  Serial.println("Display: Backlight eingeschaltet");
+
   pinMode(DISPLAY_BUTTON_A, INPUT_PULLUP);
 
-  Display.init();
-  Display.setRotation(1);
-  Display.setTextWrap(false, false);
-  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+  DisplaySPI.begin(DISPLAY_SCLK, -1, DISPLAY_MOSI, DISPLAY_CS);
+  Serial.println("Display: SPI gestartet");
 
-  Display.fillScreen(TFT_RED);
-  delay(250);
-  Display.fillScreen(TFT_GREEN);
-  delay(250);
-  Display.fillScreen(TFT_BLUE);
-  delay(250);
-  Display.fillScreen(TFT_BLACK);
+  Display.initR(DISPLAY_INITR);
+  Serial.println("Display: ST7735 initialisiert");
+
+  Display.setRotation(1);
+  Serial.println("Display: Rotation gesetzt");
+
+  Display.setTextWrap(false);
+
+  Display.fillScreen(COLOR_RED);
+  delay(180);
+  Display.fillScreen(COLOR_GREEN);
+  delay(180);
+  Display.fillScreen(COLOR_BLUE);
+  delay(180);
+  Display.fillScreen(COLOR_BLACK);
+  Serial.println("Display: Testfarben abgeschlossen");
+
+  drawBootPage("Boot...");
   displayReady = true;
+  displayDirty = true;
 }
 
 void updateDisplay(const char* message = nullptr) {
   if (!displayReady) return;
 
+  if (message && strcmp(message, "Boot") == 0) {
+    drawBootPage("Boot...");
+    return;
+  }
+
+  // Falls die Aktivitaetsseite verschwindet waehrend sie aktiv ist: zurueck auf Status.
+  if (displayPage >= displayPageCount()) {
+    displayPage = displayPageCount() - 1;
+    displayDirty = true;
+  }
+
   String apIp = WiFi.softAPIP().toString();
   String wifiIp = displayWifiIp();
   String state = flowStateName();
-  String snapshot = String(displayPage) + "|" + apIp + "|" + wifiIp + "|" + state + "|" +
+  String snapshot = String(displayPage) + "|" + String(displayPageCount()) + "|" + apIp + "|" + wifiIp + "|" + state + "|" +
                     String(autoLoopEnabled) + "|" + hidStatusLabel() + "|" + nextTriggerLabel() + "|" +
                     lastTrigger + "|" + String(message ? message : "");
   static String lastSnapshot;
@@ -350,8 +470,10 @@ void updateDisplay(const char* message = nullptr) {
 
   if (displayPage == 0) {
     drawNetworkPage();
-  } else {
+  } else if (displayPage == 1) {
     drawStatusPage();
+  } else {
+    drawActivityPage();
   }
 }
 
@@ -396,23 +518,50 @@ void onUsbEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void* ev
 }
 
 void showNextDisplayPage() {
-  displayPage = (displayPage + 1) % DISPLAY_PAGE_COUNT;
+  displayPage = (displayPage + 1) % displayPageCount();
   nextDisplayPageAt = millis() + DISPLAY_PAGE_MS;
   displayDirty = true;
 }
 
+void toggleAutoLoop() {
+  autoLoopEnabled = !autoLoopEnabled;
+  saveSettings();
+  if (!autoLoopEnabled && flowState == FLOW_AUTO_STANDBY) {
+    flowState = FLOW_IDLE;
+  }
+  displayDirty = true;
+  Serial.printf("Auto-Loop per Taste: %s\n", autoLoopEnabled ? "ein" : "aus");
+  updateDisplay(autoLoopEnabled ? "Auto: ein" : "Auto: aus");
+}
+
 void handleDisplayButtons() {
   bool pressed = digitalRead(DISPLAY_BUTTON_A) == LOW;
-  if (!pressed) {
-    displayButtonWasPressed = false;
+
+  if (pressed && !displayButtonWasPressed) {
+    if (!timeReached(lastDisplayButtonAt + BUTTON_DEBOUNCE_MS)) return;
+    displayButtonWasPressed = true;
+    displayButtonLongFired = false;
+    displayButtonDownAt = millis();
     return;
   }
-  if (displayButtonWasPressed) return;
-  if (!timeReached(lastDisplayButtonAt + BUTTON_DEBOUNCE_MS)) return;
 
-  displayButtonWasPressed = true;
-  lastDisplayButtonAt = millis();
-  showNextDisplayPage();
+  if (pressed && displayButtonWasPressed && !displayButtonLongFired &&
+      timeReached(displayButtonDownAt + LONG_PRESS_MS)) {
+    // Langer Druck: Aktion sofort ausloesen (Auto-Loop umschalten).
+    displayButtonLongFired = true;
+    lastDisplayButtonAt = millis();
+    toggleAutoLoop();
+    return;
+  }
+
+  if (!pressed && displayButtonWasPressed) {
+    displayButtonWasPressed = false;
+    lastDisplayButtonAt = millis();
+    if (!displayButtonLongFired) {
+      // Kurzer Druck: zur naechsten Seite blaettern.
+      showNextDisplayPage();
+    }
+  }
 }
 
 void handleDisplayPaging() {
@@ -665,12 +814,77 @@ void connectWifi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    wifiWasConnected = true;
     Serial.printf("Heimnetz verbunden: http://%s/\n", WiFi.localIP().toString().c_str());
     updateDisplay("WLAN verbunden");
   } else {
     Serial.println("Heimnetz-Verbindung fehlgeschlagen. AP bleibt aktiv.");
     updateDisplay("AP-Modus");
   }
+}
+
+void setupOta() {
+  if (otaStarted) return;
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(AP_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    autoLoopEnabled = false;  // Automatik waehrend des Updates anhalten
+    flowState = FLOW_IDLE;
+    Serial.println("OTA: Update startet");
+    if (displayReady) drawBootPage("OTA Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA: fertig");
+    if (displayReady) drawBootPage("OTA fertig");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    static uint8_t lastPct = 255;
+    uint8_t pct = total ? (uint8_t)(progress * 100 / total) : 0;
+    if (pct == lastPct) return;
+    lastPct = pct;
+    Serial.printf("OTA: %u%%\n", pct);
+    char msg[16];
+    snprintf(msg, sizeof(msg), "OTA %u%%", pct);
+    if (displayReady) drawBootPage(msg);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Fehler [%u]\n", error);
+    if (displayReady) drawBootPage("OTA Fehler");
+    displayDirty = true;
+  });
+
+  ArduinoOTA.begin();
+  otaStarted = true;
+  Serial.printf("OTA bereit: %s.local\n", OTA_HOSTNAME);
+}
+
+// Haelt die WLAN-Verbindung am Leben und meldet Statuswechsel.
+void maintainWifi() {
+  if (wifiSsid.length() == 0) return;
+
+  bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected != wifiWasConnected) {
+    wifiWasConnected = connected;
+    displayDirty = true;
+    if (connected) {
+      Serial.printf("WLAN wieder verbunden: http://%s/\n", WiFi.localIP().toString().c_str());
+      if (!timeSynced) syncTimeNow(2000);
+      setupOta();
+    } else {
+      Serial.println("WLAN-Verbindung verloren, versuche Reconnect.");
+    }
+  }
+
+  if (connected) return;
+  if (!timeReached(nextWifiRetryAt)) return;
+
+  nextWifiRetryAt = millis() + WIFI_RETRY_MS;
+  Serial.println("WLAN-Reconnect-Versuch ...");
+  WiFi.disconnect();
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 }
 
 String schedulesJson() {
@@ -1471,9 +1685,34 @@ String indexHtml() {
       input.value = soon.toISOString().slice(0, 16);
     }
 
+    let pollTimer = null;
+    function startPolling() {
+      if (pollTimer) return;
+      pollTimer = setInterval(refreshStatus, 3000);
+    }
+    function stopPolling() {
+      if (!pollTimer) return;
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    function connectEvents() {
+      if (!window.EventSource) { startPolling(); return; }
+      try {
+        const es = new EventSource('/api/events');
+        es.onopen = () => stopPolling();
+        es.onmessage = (ev) => {
+          try { applyStatus(JSON.parse(ev.data)); } catch (e) {}
+        };
+        es.onerror = () => { startPolling(); };
+      } catch (e) {
+        startPolling();
+      }
+    }
+
     initScheduleInput();
     refreshStatus();
-    setInterval(refreshStatus, 3000);
+    connectEvents();
     setInterval(tick, 1000);
   </script>
 </body>
@@ -1499,6 +1738,47 @@ void handleRoot() {
 
 void handleStatus() {
   Server.send(200, "application/json", statusJson());
+}
+
+// Server-Sent-Events: haelt die Verbindung offen und behaelt eine Kopie des Clients.
+void handleEvents() {
+  WiFiClient client = Server.client();
+  client.print(F("HTTP/1.1 200 OK\r\n"
+                 "Content-Type: text/event-stream\r\n"
+                 "Cache-Control: no-cache\r\n"
+                 "Connection: keep-alive\r\n"
+                 "Access-Control-Allow-Origin: *\r\n\r\n"));
+  client.print(F("retry: 3000\n\n"));
+  client.print("data: " + statusJson() + "\n\n");
+
+  for (uint8_t i = 0; i < SSE_MAX_CLIENTS; i++) {
+    if (!sseClients[i] || !sseClients[i].connected()) {
+      sseClients[i] = client;
+      return;
+    }
+  }
+  // Kein freier Platz: aeltesten Client ersetzen.
+  sseClients[0].stop();
+  sseClients[0] = client;
+}
+
+void broadcastStatus() {
+  bool any = false;
+  for (uint8_t i = 0; i < SSE_MAX_CLIENTS; i++) {
+    if (sseClients[i] && sseClients[i].connected()) { any = true; break; }
+  }
+  if (!any) return;
+
+  String payload = "data: " + statusJson() + "\n\n";
+  for (uint8_t i = 0; i < SSE_MAX_CLIENTS; i++) {
+    if (!sseClients[i]) continue;
+    if (sseClients[i].connected()) {
+      sseClients[i].print(payload);
+    } else {
+      sseClients[i].stop();
+      sseClients[i] = WiFiClient();
+    }
+  }
 }
 
 void handleTrigger() {
@@ -1599,6 +1879,7 @@ void handleWifiSave() {
 void setupRoutes() {
   Server.on("/", HTTP_GET, handleRoot);
   Server.on("/api/status", HTTP_GET, handleStatus);
+  Server.on("/api/events", HTTP_GET, handleEvents);
   Server.on("/api/trigger", HTTP_POST, handleTrigger);
   Server.on("/api/trigger", HTTP_GET, handleTrigger);
   Server.on("/api/mouse", HTTP_POST, handleMouseMove);
@@ -1622,12 +1903,16 @@ void setupRoutes() {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(200);
   Serial.println("Boot HID Steuerung");
+
+  setupDisplay();
+  updateDisplay("Boot");
 
   loadSettings();
   loadSchedules();
   connectWifi();
+  updateDisplay("Netz bereit");
   setupRoutes();
 
   Serial.println("Starte USB HID...");
@@ -1640,17 +1925,10 @@ void setup() {
   configTzTime(TZ_INFO, NTP_SERVER1, NTP_SERVER2);
   if (WiFi.status() == WL_CONNECTED) {
     syncTimeNow(5000);
+    setupOta();
   }
 
-  Serial.printf("Display startet in %lu ms...\n", (unsigned long)DISPLAY_START_DELAY_MS);
-  uint32_t displayStartAt = millis() + DISPLAY_START_DELAY_MS;
-  while (!timeReached(displayStartAt)) {
-    Server.handleClient();
-    delay(10);
-  }
-
-  setupDisplay();
-  updateDisplay("Startet");
+  updateDisplay("Bereit");
 
   delay(1000);
   drawStartupRectangle();
@@ -1669,10 +1947,16 @@ void setup() {
 
 void loop() {
   Server.handleClient();
+  if (otaStarted) ArduinoOTA.handle();
+  maintainWifi();
   maintainTime();
   checkSchedules();
   handleFlow();
   handleDisplayPaging();
+  if (timeReached(nextSseAt)) {
+    nextSseAt = millis() + SSE_INTERVAL_MS;
+    broadcastStatus();
+  }
   if (timeReached(nextDisplayRefreshAt)) {
     nextDisplayRefreshAt = millis() + DISPLAY_REFRESH_MS;
     updateDisplay();
