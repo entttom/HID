@@ -5,21 +5,23 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <time.h>
+#include <TFT_eSPI.h>
 
 USBHIDKeyboard Keyboard;
 USBHIDMouse    Mouse;
 WebServer      Server(80);
 Preferences    Settings;
+TFT_eSPI Display = TFT_eSPI();
 
 // --- Konfiguration ---
 const uint32_t CLICK_DELAY_MS     = 50;
 const uint32_t AFTER_CLICK_WAIT   = 5000;          // 5 s
 const uint32_t AFTER_ENTER_WAIT   = 20000;         // 20 s
-const uint32_t JIGGLE_INTERVAL    = 10000;         // alle 10 s im Standby sichtbar bewegen
+const uint32_t JIGGLE_INTERVAL    = 10UL * 60UL * 1000UL; // alle 10 min kaum merkbar bewegen
 const uint32_t LONG_WAIT_MIN_MS   = 25UL * 60UL * 1000UL;
 const uint32_t LONG_WAIT_MAX_MS   = 35UL * 60UL * 1000UL;
 const int16_t  START_RECT_CM      = 5;             // sichtbarer Start-Indikator
-const int16_t  STANDBY_WANDER_CM  = 1;             // sichtbarer Lauf-Indikator
+const int16_t  STANDBY_JIGGLE_PX  = 1;             // minimales Wachhalte-Jiggle
 const int16_t  PIXELS_PER_CM      = 38;            // Naeherung bei 96 dpi
 const int8_t   START_RECT_STEP    = 5;             // kleine Schritte fuer langsame Bewegung
 const uint16_t START_RECT_DELAY   = 50;            // ms pro Schritt
@@ -33,12 +35,37 @@ const char*    TZ_INFO            = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europe/Vie
 const uint8_t  MAX_SCHEDULES      = 8;
 const uint32_t TIME_RETRY_MS      = 60000;          // erneuter Sync-Versuch
 const int32_t  SCHEDULE_GRACE_S   = 3600;           // verpasste Auslösung noch bis 1 h spaeter nachholen
+const uint32_t DISPLAY_REFRESH_MS = 1000;
+const uint32_t DISPLAY_PAGE_MS    = 5000;
+const uint32_t DISPLAY_START_DELAY_MS = 10000;
+const uint32_t BUTTON_DEBOUNCE_MS = 220;
+const uint8_t  DISPLAY_PAGE_COUNT = 2;
+const uint8_t  DISPLAY_BUTTON_A   = 0;
+
+#ifndef PIN_POWER_ON
+#define PIN_POWER_ON -1
+#endif
+
+#ifndef TFT_BL
+#define TFT_BL 38
+#endif
+
+#ifndef TFT_BACKLIGHT_ON
+#define TFT_BACKLIGHT_ON HIGH
+#endif
 
 enum FlowState {
   FLOW_IDLE,
   FLOW_AFTER_CLICK_WAIT,
   FLOW_AFTER_ENTER_WAIT,
   FLOW_AUTO_STANDBY
+};
+
+enum UsbRuntimeState {
+  USB_WAITING,
+  USB_ACTIVE,
+  USB_SUSPENDED,
+  USB_STOPPED
 };
 
 FlowState flowState = FLOW_IDLE;
@@ -51,6 +78,17 @@ String lastTrigger = "none";
 time_t schedules[MAX_SCHEDULES];
 bool timeSynced = false;
 uint32_t nextTimeRetryAt = 0;
+uint32_t nextDisplayRefreshAt = 0;
+uint32_t nextDisplayPageAt = 0;
+uint32_t lastDisplayButtonAt = 0;
+uint8_t displayPage = 0;
+bool displayDirty = true;
+bool displayButtonWasPressed = false;
+bool displayReady = false;
+volatile UsbRuntimeState usbRuntimeState = USB_WAITING;
+volatile bool usbWasMounted = false;
+
+const char* flowStateName();
 
 void moveMouseSlow(int16_t dx, int16_t dy) {
   bool horizontal = dx != 0;
@@ -74,10 +112,9 @@ void moveMouseSlow(int16_t dx, int16_t dy) {
 }
 
 void jiggleOnce() {
-  int16_t distance = STANDBY_WANDER_CM * PIXELS_PER_CM;
-
-  moveMouseSlow(-distance, 0);
-  moveMouseSlow(distance, 0);
+  Mouse.move(-STANDBY_JIGGLE_PX, 0);
+  delay(20);
+  Mouse.move(STANDBY_JIGGLE_PX, 0);
 }
 
 void drawStartupRectangle() {
@@ -126,6 +163,198 @@ String jsonEscape(const String& value) {
   return escaped;
 }
 
+String displayWifiIp() {
+  return WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "nicht verbunden";
+}
+
+bool hidActive() {
+  return (bool)USB && usbRuntimeState != USB_SUSPENDED;
+}
+
+String flowStateDisplayName() {
+  switch (flowState) {
+    case FLOW_IDLE:
+      return "Bereit";
+    case FLOW_AFTER_CLICK_WAIT:
+      return "Klick warte";
+    case FLOW_AFTER_ENTER_WAIT:
+      return "Enter warte";
+    case FLOW_AUTO_STANDBY:
+      return "Auto Standby";
+  }
+
+  return "Unbekannt";
+}
+
+String modeLabel() {
+  return autoLoopEnabled ? "Automatik ein" : "Manuell";
+}
+
+String hidStatusLabel() {
+  if (hidActive()) return "HID aktiv";
+  if (usbRuntimeState == USB_SUSPENDED) return "USB pausiert";
+  if (usbRuntimeState == USB_STOPPED) return "USB getrennt";
+  if (usbWasMounted) return "Host verloren";
+  return "warte auf Host";
+}
+
+uint16_t hidStatusColor() {
+  if (hidActive()) return TFT_GREEN;
+  if (usbRuntimeState == USB_SUSPENDED) return TFT_ORANGE;
+  return TFT_RED;
+}
+
+String durationLabelMs(uint64_t ms) {
+  uint32_t seconds = (ms + 999) / 1000;
+  uint32_t days = seconds / 86400;
+  seconds -= days * 86400;
+  uint32_t hours = seconds / 3600;
+  seconds -= hours * 3600;
+  uint32_t minutes = seconds / 60;
+  seconds -= minutes * 60;
+
+  if (days > 0) return String(days) + "d " + String(hours) + "h";
+  if (hours > 0) return String(hours) + "h " + String(minutes) + "m";
+  if (minutes > 0) return String(minutes) + "m " + String(seconds) + "s";
+  return String(seconds) + "s";
+}
+
+time_t nextScheduleTime() {
+  time_t next = 0;
+  for (uint8_t i = 0; i < MAX_SCHEDULES; i++) {
+    if (schedules[i] == 0) continue;
+    if (next == 0 || schedules[i] < next) next = schedules[i];
+  }
+  return next;
+}
+
+String nextTriggerLabel() {
+  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT) {
+    return "Flow laeuft";
+  }
+
+  if (flowState == FLOW_AUTO_STANDBY) {
+    uint32_t remaining = timeReached(stateUntil) ? 0 : stateUntil - millis();
+    return "Auto in " + durationLabelMs(remaining);
+  }
+
+  if (autoLoopEnabled) {
+    return "Auto sofort";
+  }
+
+  time_t next = nextScheduleTime();
+  if (next == 0) return "keine";
+  if (!timeSynced) return "Zeit fehlt";
+
+  time_t now = time(nullptr);
+  if (next <= now) return "faellig";
+  return "Plan in " + durationLabelMs((uint64_t)(next - now) * 1000ULL);
+}
+
+void drawPageIndicator() {
+  const int16_t x = Display.width() - 6;
+  const int16_t half = Display.height() / 2;
+  uint16_t inactive = TFT_DARKGREY;
+
+  Display.fillRect(x, 0, 6, half - 1, displayPage == 0 ? TFT_YELLOW : inactive);
+  Display.fillRect(x, half + 1, 6, Display.height() - half - 1, displayPage == 1 ? TFT_YELLOW : inactive);
+}
+
+String fitDisplayText(const String& value, uint8_t maxChars = 18) {
+  if (value.length() <= maxChars) return value;
+  return value.substring(0, maxChars - 3) + "...";
+}
+
+void drawLabelValue(int16_t y, const String& label, const String& value, uint16_t valueColor = TFT_WHITE) {
+  Display.setTextFont(1);
+  Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  Display.setCursor(4, y);
+  Display.print(label);
+  Display.setTextColor(valueColor, TFT_BLACK);
+  Display.setCursor(48, y);
+  Display.print(fitDisplayText(value, 17));
+}
+
+void drawDisplayHeader(const char* title) {
+  Display.fillScreen(TFT_BLACK);
+  Display.setTextFont(2);
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.setCursor(4, 1);
+  Display.print(title);
+  Display.drawFastHLine(4, 20, Display.width() - 16, TFT_DARKGREY);
+  drawPageIndicator();
+}
+
+void drawNetworkPage() {
+  drawDisplayHeader("Netz");
+
+  Display.setTextColor(TFT_CYAN, TFT_BLACK);
+  Display.setTextFont(1);
+  Display.setCursor(4, 24);
+  Display.print("AP");
+  Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  Display.setTextFont(4);
+  Display.setCursor(4, 36);
+  Display.print(WiFi.softAPIP().toString());
+
+  drawLabelValue(66, "WLAN", displayWifiIp(), WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_ORANGE);
+}
+
+void drawStatusPage() {
+  drawDisplayHeader("Status");
+
+  drawLabelValue(24, "HID", hidStatusLabel(), hidStatusColor());
+  drawLabelValue(38, "Mode", modeLabel(), autoLoopEnabled ? TFT_GREEN : TFT_WHITE);
+  drawLabelValue(52, "Flow", flowStateDisplayName(), flowState == FLOW_IDLE ? TFT_WHITE : TFT_ORANGE);
+  drawLabelValue(66, "Next", nextTriggerLabel(), TFT_CYAN);
+}
+
+void setupDisplay() {
+  if (PIN_POWER_ON >= 0) {
+    pinMode(PIN_POWER_ON, OUTPUT);
+    digitalWrite(PIN_POWER_ON, HIGH);
+  }
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+  pinMode(DISPLAY_BUTTON_A, INPUT_PULLUP);
+
+  Display.init();
+  Display.setRotation(1);
+  Display.setTextWrap(false, false);
+  digitalWrite(TFT_BL, TFT_BACKLIGHT_ON);
+
+  Display.fillScreen(TFT_RED);
+  delay(250);
+  Display.fillScreen(TFT_GREEN);
+  delay(250);
+  Display.fillScreen(TFT_BLUE);
+  delay(250);
+  Display.fillScreen(TFT_BLACK);
+  displayReady = true;
+}
+
+void updateDisplay(const char* message = nullptr) {
+  if (!displayReady) return;
+
+  String apIp = WiFi.softAPIP().toString();
+  String wifiIp = displayWifiIp();
+  String state = flowStateName();
+  String snapshot = String(displayPage) + "|" + apIp + "|" + wifiIp + "|" + state + "|" +
+                    String(autoLoopEnabled) + "|" + hidStatusLabel() + "|" + nextTriggerLabel() + "|" +
+                    lastTrigger + "|" + String(message ? message : "");
+  static String lastSnapshot;
+
+  if (!displayDirty && snapshot == lastSnapshot) return;
+  lastSnapshot = snapshot;
+  displayDirty = false;
+
+  if (displayPage == 0) {
+    drawNetworkPage();
+  } else {
+    drawStatusPage();
+  }
+}
+
 const char* flowStateName() {
   switch (flowState) {
     case FLOW_IDLE:
@@ -139,6 +368,59 @@ const char* flowStateName() {
   }
 
   return "unknown";
+}
+
+void onUsbEvent(void* arg, esp_event_base_t eventBase, int32_t eventId, void* eventData) {
+  (void)arg;
+  (void)eventBase;
+  (void)eventData;
+
+  switch (eventId) {
+    case ARDUINO_USB_STARTED_EVENT:
+      usbRuntimeState = USB_ACTIVE;
+      usbWasMounted = true;
+      break;
+    case ARDUINO_USB_STOPPED_EVENT:
+      usbRuntimeState = USB_STOPPED;
+      break;
+    case ARDUINO_USB_SUSPEND_EVENT:
+      usbRuntimeState = USB_SUSPENDED;
+      break;
+    case ARDUINO_USB_RESUME_EVENT:
+      usbRuntimeState = USB_ACTIVE;
+      usbWasMounted = true;
+      break;
+  }
+
+  displayDirty = true;
+}
+
+void showNextDisplayPage() {
+  displayPage = (displayPage + 1) % DISPLAY_PAGE_COUNT;
+  nextDisplayPageAt = millis() + DISPLAY_PAGE_MS;
+  displayDirty = true;
+}
+
+void handleDisplayButtons() {
+  bool pressed = digitalRead(DISPLAY_BUTTON_A) == LOW;
+  if (!pressed) {
+    displayButtonWasPressed = false;
+    return;
+  }
+  if (displayButtonWasPressed) return;
+  if (!timeReached(lastDisplayButtonAt + BUTTON_DEBOUNCE_MS)) return;
+
+  displayButtonWasPressed = true;
+  lastDisplayButtonAt = millis();
+  showNextDisplayPage();
+}
+
+void handleDisplayPaging() {
+  handleDisplayButtons();
+
+  if (timeReached(nextDisplayPageAt)) {
+    showNextDisplayPage();
+  }
 }
 
 void saveSettings() {
@@ -361,16 +643,19 @@ void checkSchedules() {
 void connectWifi() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  updateDisplay("AP gestartet");
 
   Serial.printf("AP gestartet: %s / http://%s/\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
   if (wifiSsid.length() == 0) {
     Serial.println("Keine Heimnetz-Zugangsdaten gespeichert.");
+    updateDisplay("AP-Modus");
     return;
   }
 
   Serial.printf("Verbinde mit WLAN: %s\n", wifiSsid.c_str());
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  updateDisplay("WLAN verbindet");
 
   uint32_t timeoutAt = millis() + WIFI_CONNECT_MS;
   while (WiFi.status() != WL_CONNECTED && !timeReached(timeoutAt)) {
@@ -381,8 +666,10 @@ void connectWifi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("Heimnetz verbunden: http://%s/\n", WiFi.localIP().toString().c_str());
+    updateDisplay("WLAN verbunden");
   } else {
     Serial.println("Heimnetz-Verbindung fehlgeschlagen. AP bleibt aktiv.");
+    updateDisplay("AP-Modus");
   }
 }
 
@@ -411,6 +698,9 @@ String statusJson() {
   json += ",\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
   json += ",\"wifiIp\":\"" + WiFi.localIP().toString() + "\"";
   json += ",\"wifiSsid\":\"" + jsonEscape(wifiSsid) + "\"";
+  json += ",\"hidActive\":" + String(hidActive() ? "true" : "false");
+  json += ",\"usbMounted\":" + String((bool)USB ? "true" : "false");
+  json += ",\"usbState\":\"" + jsonEscape(hidStatusLabel()) + "\"";
   json += ",\"time\":" + String((uint32_t)time(nullptr));
   json += ",\"timeSynced\":" + String(timeSynced ? "true" : "false");
   json += ",\"maxSchedules\":" + String(MAX_SCHEDULES);
@@ -1300,6 +1590,7 @@ void handleWifiSave() {
   if (wifiSsid.length() > 0) {
     WiFi.disconnect();
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    updateDisplay("WLAN verbindet");
   }
 
   redirectHome();
@@ -1331,14 +1622,19 @@ void setupRoutes() {
 
 void setup() {
   Serial.begin(115200);
-
-  Keyboard.begin();
-  Mouse.begin();
-  USB.begin();
+  delay(500);
+  Serial.println("Boot HID Steuerung");
 
   loadSettings();
   loadSchedules();
   connectWifi();
+  setupRoutes();
+
+  Serial.println("Starte USB HID...");
+  USB.onEvent(onUsbEvent);
+  Keyboard.begin();
+  Mouse.begin();
+  USB.begin();
 
   // Zeit beim Start holen (Mitteleuropa). SNTP laeuft im Hintergrund weiter.
   configTzTime(TZ_INFO, NTP_SERVER1, NTP_SERVER2);
@@ -1346,7 +1642,15 @@ void setup() {
     syncTimeNow(5000);
   }
 
-  setupRoutes();
+  Serial.printf("Display startet in %lu ms...\n", (unsigned long)DISPLAY_START_DELAY_MS);
+  uint32_t displayStartAt = millis() + DISPLAY_START_DELAY_MS;
+  while (!timeReached(displayStartAt)) {
+    Server.handleClient();
+    delay(10);
+  }
+
+  setupDisplay();
+  updateDisplay("Startet");
 
   delay(1000);
   drawStartupRectangle();
@@ -1358,6 +1662,8 @@ void setup() {
     Server.handleClient();
   }
   nextJiggleAt = millis() + JIGGLE_INTERVAL;
+  nextDisplayPageAt = millis() + DISPLAY_PAGE_MS;
+  updateDisplay("Bereit");
   Serial.println("Bereit.");
 }
 
@@ -1366,5 +1672,10 @@ void loop() {
   maintainTime();
   checkSchedules();
   handleFlow();
+  handleDisplayPaging();
+  if (timeReached(nextDisplayRefreshAt)) {
+    nextDisplayRefreshAt = millis() + DISPLAY_REFRESH_MS;
+    updateDisplay();
+  }
   delay(5);
 }

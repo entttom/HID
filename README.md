@@ -1,12 +1,13 @@
 # HID Steuerung
 
-ESP32-S3/Arduino-Sketch fuer eine USB-HID Maus- und Tastatursteuerung mit lokaler Weboberflaeche, eigenem WLAN-Access-Point und optionaler Heimnetz-Integration.
+ESP32-S3/Arduino-Sketch fuer eine USB-HID Maus- und Tastatursteuerung auf dem LilyGO T-Dongle-S3 mit lokaler Weboberflaeche, eigenem WLAN-Access-Point, optionaler Heimnetz-Integration und IP-Anzeige am Display.
 
 ![Weboberflaeche](docs/web-ui.png)
 
 ## Funktionen
 
 - USB-HID Maus und Tastatur
+- LilyGO T-Dongle-S3 Display zeigt AP-IP, Heimnetz-IP, HID-Status, Modus und naechste Ausloesung
 - Eigener Setup-Access-Point: `HID-Setup`
 - Optionaler Beitritt zum Heimnetz ueber die Weboberflaeche
 - Lokale, mobilfreundliche Website ohne externe JS-/CSS-Abhaengigkeiten
@@ -17,15 +18,16 @@ ESP32-S3/Arduino-Sketch fuer eine USB-HID Maus- und Tastatursteuerung mit lokale
 - Live-Statusanzeige mit Gerätezeit, Flow-Zustand und Countdown zur nächsten Auslösung
 - Manuelle Maussteuerung per Pfeiltasten auf der Website
 - Manueller Linksklick per Website oder API
-- Bildschirm-Wachhalten auch im Leerlauf (Maus wackelt alle 10 s leicht)
+- Bildschirm-Wachhalten auch im Leerlauf (Maus bewegt sich alle 10 Minuten minimal um 1 Pixel links/rechts)
 
 ## Ablauf
 
 Beim Einstecken:
 
 1. USB-HID wird initialisiert.
-2. Die Maus faehrt ein sichtbares ca. 5 x 5 cm Rechteck ab.
-3. Danach startet die Websteuerung und der Sketch ist bereit.
+2. Das LilyGO-Dongle-Display zeigt die Setup-IP an.
+3. Die Maus faehrt ein sichtbares ca. 5 x 5 cm Rechteck ab.
+4. Danach startet die Websteuerung und der Sketch ist bereit.
 
 Der Flow macht:
 
@@ -35,9 +37,9 @@ Der Flow macht:
 4. 20 Sekunden warten
 5. `Strg + Alt + F`
 
-Wenn die automatische Schleife aktiv ist, wartet der Sketch nach jedem Flow zufaellig 25 bis 35 Minuten und startet dann erneut. Im Standby bewegt sich die Maus regelmaessig ca. 1 cm nach links und wieder zurueck, damit sichtbar ist, dass der Sketch noch laeuft.
+Wenn die automatische Schleife aktiv ist, wartet der Sketch nach jedem Flow zufaellig 25 bis 35 Minuten und startet dann erneut.
 
-Auch im Leerlauf (Automatik aus) wackelt die Maus alle 10 Sekunden leicht hin und her, damit der Bildschirm nicht in den Energiesparmodus wechselt.
+Auch im Leerlauf (Automatik aus) bewegt sich die Maus alle 10 Minuten nur um 1 Pixel nach links und direkt wieder zurueck, damit der Bildschirm wach bleibt, ohne dass man die Bewegung praktisch bemerkt.
 
 ## Geplante Auslösung
 
@@ -60,6 +62,15 @@ Auf der Website kann man:
 - einen Linksklick senden
 
 Der Access-Point bleibt aktiv, auch wenn das Geraet zusaetzlich im Heimnetz verbunden ist.
+
+Auf dem LilyGO-Dongle-Display gibt es zwei Seiten:
+
+1. Netzwerk: AP-IP (`192.168.4.1`), Heimnetz-IP und SSID.
+2. Status: HID/USB-Status, Modus, Flow-Zustand, naechste Ausloesung und letzte Ausloesungsquelle.
+
+Die Seiten wechseln automatisch alle 5 Sekunden. Mit der BOOT-Taste kann man sofort zur naechsten Seite wechseln. Rechts am Display zeigt ein schmaler gelber Balken die aktuelle Seite: oben gelb fuer Netzwerk, unten gelb fuer Status.
+
+Die Anzeige `HID aktiv` bedeutet, dass TinyUSB vom Host konfiguriert/gemountet wurde. Ob das Betriebssystem das Geraet in seiner Oberflaeche explizit als Maus/Tastatur benennt, kann der Mikrocontroller nicht direkt zuruecklesen.
 
 ## API
 
@@ -122,4 +133,11 @@ Das Statusobjekt aus `GET /api/status` enthaelt zusaetzlich `time` (Epoch), `tim
 
 ## Build
 
-Dieses Repository enthaelt aktuell nur den Arduino-Sketch unter `sketch/sketch.ino`. Eine `platformio.ini` oder Arduino-CLI-Projektkonfiguration ist nicht enthalten.
+Mit PlatformIO:
+
+```bash
+pio run -e lilygo-t-dongle-s3
+pio run -e lilygo-t-dongle-s3 -t upload
+```
+
+Die Projektkonfiguration nutzt ein lokales Boardprofil `lilygo-t-dongle-s3-hid` und konfiguriert `TFT_eSPI` fuer das integrierte 80 x 160 ST7735-SPI-Display des LilyGO T-Dongle-S3. In der Arduino IDE funktioniert der Sketch ebenfalls, wenn ein ESP32-S3-Board mit TinyUSB/HID und eine passend konfigurierte `TFT_eSPI`-Installation fuer das LilyGO T-Dongle-S3 verwendet wird.
