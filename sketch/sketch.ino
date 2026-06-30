@@ -523,15 +523,28 @@ void showNextDisplayPage() {
   displayDirty = true;
 }
 
-void toggleAutoLoop() {
-  autoLoopEnabled = !autoLoopEnabled;
+// Bricht einen laufenden Flow ab und schaltet die Automatik aus.
+void stopFlowAndAuto() {
+  autoLoopEnabled = false;
+  flowState = FLOW_IDLE;
+  stateUntil = 0;
   saveSettings();
-  if (!autoLoopEnabled && flowState == FLOW_AUTO_STANDBY) {
-    flowState = FLOW_IDLE;
-  }
   displayDirty = true;
-  Serial.printf("Auto-Loop per Taste: %s\n", autoLoopEnabled ? "ein" : "aus");
-  updateDisplay(autoLoopEnabled ? "Auto: ein" : "Auto: aus");
+}
+
+// Langer Tastendruck: laeuft etwas -> stoppen, sonst Automatik einschalten.
+void buttonLongAction() {
+  if (autoLoopEnabled || flowState != FLOW_IDLE) {
+    stopFlowAndAuto();
+    Serial.println("Flow/Automatik per Taste gestoppt");
+    updateDisplay("Gestoppt");
+  } else {
+    autoLoopEnabled = true;
+    saveSettings();
+    displayDirty = true;
+    Serial.println("Automatik per Taste: ein");
+    updateDisplay("Auto: ein");
+  }
 }
 
 void handleDisplayButtons() {
@@ -550,7 +563,7 @@ void handleDisplayButtons() {
     // Langer Druck: Aktion sofort ausloesen (Auto-Loop umschalten).
     displayButtonLongFired = true;
     lastDisplayButtonAt = millis();
-    toggleAutoLoop();
+    buttonLongAction();
     return;
   }
 
@@ -1395,6 +1408,7 @@ String indexHtml() {
           <p class="muted">Ablauf: Linksklick, 5 s warten, Enter, 20 s warten, Strg+Alt+F.</p>
           <div class="actions">
             <button id="triggerButton" type="button" onclick="triggerFlow()">Flow ausloesen</button>
+            <button id="stopButton" class="secondary" type="button" onclick="stopFlow()">Flow stoppen</button>
             <button class="secondary" type="button" onclick="refreshStatus()">Status aktualisieren</button>
           </div>
           <div id="message" class="toast" role="status"></div>
@@ -1418,18 +1432,13 @@ String indexHtml() {
 
         <section>
           <h2>Betrieb</h2>
-          <form method="post" action="/settings">
-            <label class="switch-row">
-              <input id="autoInput" type="checkbox" name="auto" value="1" AUTO_CHECKED>
-              <span class="switch-copy">
-                <strong>Automatische Schleife</strong>
-                <span class="muted">Aus: Flow nur per Website oder API.</span>
-              </span>
-            </label>
-            <div class="form-actions">
-              <button type="submit">Einstellung speichern</button>
-            </div>
-          </form>
+          <label class="switch-row">
+            <input id="autoInput" type="checkbox" onchange="setAuto(this.checked)" AUTO_CHECKED>
+            <span class="switch-copy">
+              <strong>Automatische Schleife</strong>
+              <span class="muted">Wird sofort gespeichert. Aus: Flow nur per Website oder API.</span>
+            </span>
+          </label>
         </section>
 
         <section class="wide">
@@ -1503,6 +1512,34 @@ String indexHtml() {
 
       await refreshStatus();
       triggerButton.disabled = false;
+    }
+
+    async function stopFlow() {
+      setMessage('Flow wird gestoppt ...', false);
+      try {
+        const response = await fetch('/api/stop', { method: 'POST' });
+        const data = await response.json();
+        applyStatus(data);
+        setMessage(data.ok ? 'Flow gestoppt.' : (data.error || 'Konnte nicht gestoppt werden.'), !data.ok);
+      } catch (error) {
+        setMessage('Keine Verbindung zum Geraet.', true);
+      }
+    }
+
+    let autoPending = false;
+    async function setAuto(on) {
+      autoPending = true;
+      setMessage(on ? 'Automatik wird aktiviert ...' : 'Automatik wird deaktiviert ...', false);
+      try {
+        const response = await fetch('/api/settings?auto=' + (on ? '1' : '0'), { method: 'POST' });
+        const data = await response.json();
+        applyStatus(data);
+        setMessage(on ? 'Automatik aktiviert.' : 'Automatik deaktiviert.', false);
+      } catch (error) {
+        setMessage('Keine Verbindung zum Geraet.', true);
+      } finally {
+        autoPending = false;
+      }
     }
 
     async function moveMouse(x, y) {
@@ -1628,7 +1665,9 @@ String indexHtml() {
       document.getElementById('flowDot').className = 'dot ' + info.dot;
       document.getElementById('autoState').textContent = data.autoLoopEnabled ? 'Ein' : 'Aus';
       document.getElementById('wifiState').textContent = data.wifiConnected ? data.wifiIp : 'AP-Modus';
-      document.getElementById('autoInput').checked = !!data.autoLoopEnabled;
+      if (!autoPending) {
+        document.getElementById('autoInput').checked = !!data.autoLoopEnabled;
+      }
 
       const sync = document.getElementById('clockSync');
       sync.textContent = timeSynced ? 'Zeit synchronisiert' : 'Zeit nicht synchronisiert';
@@ -1790,6 +1829,13 @@ void handleTrigger() {
   Server.send(200, "application/json", "{\"ok\":true}");
 }
 
+void handleStop() {
+  stopFlowAndAuto();
+  lastTrigger = "stop";
+  Serial.println("Flow gestoppt (API)");
+  Server.send(200, "application/json", statusJson());
+}
+
 void handleMouseMove() {
   int16_t dx = Server.arg("dx").toInt();
   int16_t dy = Server.arg("dy").toInt();
@@ -1882,6 +1928,8 @@ void setupRoutes() {
   Server.on("/api/events", HTTP_GET, handleEvents);
   Server.on("/api/trigger", HTTP_POST, handleTrigger);
   Server.on("/api/trigger", HTTP_GET, handleTrigger);
+  Server.on("/api/stop", HTTP_POST, handleStop);
+  Server.on("/api/stop", HTTP_GET, handleStop);
   Server.on("/api/mouse", HTTP_POST, handleMouseMove);
   Server.on("/api/mouse", HTTP_GET, handleMouseMove);
   Server.on("/api/click", HTTP_POST, handleMouseClick);
