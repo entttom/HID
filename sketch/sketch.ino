@@ -55,6 +55,8 @@ const uint32_t AFTER_ENTER_WAIT   = 20000;         // 20 s
 const uint32_t JIGGLE_INTERVAL    = 5UL * 60UL * 1000UL; // alle 5 min kaum merkbar bewegen
 const uint32_t LONG_WAIT_MIN_MS   = 25UL * 60UL * 1000UL;
 const uint32_t LONG_WAIT_MAX_MS   = 35UL * 60UL * 1000UL;
+const uint32_t MANUAL_GAP_MIN_MS  = 10UL * 1000UL;
+const uint32_t MANUAL_GAP_MAX_MS  = 30UL * 1000UL;
 const int16_t  START_RECT_CM      = 5;             // sichtbarer Start-Indikator
 const int16_t  STANDBY_JIGGLE_PX  = 2;             // minimales Wachhalte-Jiggle
 const int16_t  PIXELS_PER_CM      = 38;            // Naeherung bei 96 dpi
@@ -85,7 +87,11 @@ enum FlowState {
   FLOW_IDLE,
   FLOW_AFTER_CLICK_WAIT,
   FLOW_AFTER_ENTER_WAIT,
-  FLOW_AUTO_STANDBY
+  FLOW_AUTO_STANDBY,
+  FLOW_MANUAL_START_WAIT,
+  FLOW_MANUAL_AFTER_CLICK_WAIT,
+  FLOW_MANUAL_EVENT_WAIT,
+  FLOW_MANUAL_GAP_WAIT
 };
 
 enum UsbRuntimeState {
@@ -103,6 +109,11 @@ String wifiSsid;
 String wifiPassword;
 String lastTrigger = "none";
 time_t schedules[MAX_SCHEDULES];
+time_t manualPlanStartAt = 0;
+int32_t plannerUntilSeconds = -1;
+uint16_t plannerMinMinutes = 15;
+uint16_t plannerMaxMinutes = 44;
+uint8_t plannerEventCount = 4;
 bool timeSynced = false;
 uint32_t nextTimeRetryAt = 0;
 uint32_t nextDisplayRefreshAt = 0;
@@ -215,12 +226,21 @@ String flowStateDisplayName() {
       return "Enter warte";
     case FLOW_AUTO_STANDBY:
       return "Auto Standby";
+    case FLOW_MANUAL_START_WAIT:
+      return "Plan wartet";
+    case FLOW_MANUAL_AFTER_CLICK_WAIT:
+      return "Plan Klick";
+    case FLOW_MANUAL_EVENT_WAIT:
+      return "Plan Event";
+    case FLOW_MANUAL_GAP_WAIT:
+      return "Plan Pause";
   }
 
   return "Unbekannt";
 }
 
 String modeLabel() {
+  if (manualPlanStartAt != 0) return "Plan manuell";
   return autoLoopEnabled ? "Automatik ein" : "Manuell";
 }
 
@@ -264,8 +284,7 @@ time_t nextScheduleTime() {
 
 bool hasActivities() {
   if (autoLoopEnabled) return true;
-  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT ||
-      flowState == FLOW_AUTO_STANDBY) return true;
+  if (flowState != FLOW_IDLE || manualPlanStartAt != 0) return true;
   return nextScheduleTime() != 0;
 }
 
@@ -274,13 +293,25 @@ uint8_t displayPageCount() {
 }
 
 String nextTriggerLabel() {
-  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT) {
+  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT ||
+      flowState == FLOW_MANUAL_AFTER_CLICK_WAIT) {
     return "Flow laeuft";
   }
 
   if (flowState == FLOW_AUTO_STANDBY) {
     uint32_t remaining = timeReached(stateUntil) ? 0 : stateUntil - millis();
     return "Auto in " + durationLabelMs(remaining);
+  }
+
+  if (flowState == FLOW_MANUAL_GAP_WAIT) {
+    uint32_t remaining = timeReached(stateUntil) ? 0 : stateUntil - millis();
+    return "Klick in " + durationLabelMs(remaining);
+  }
+
+  if (flowState == FLOW_MANUAL_START_WAIT && timeSynced && manualPlanStartAt != 0) {
+    time_t now = time(nullptr);
+    if (manualPlanStartAt <= now) return "Plan startet";
+    return "Start in " + durationLabelMs((uint64_t)(manualPlanStartAt - now) * 1000ULL);
   }
 
   if (autoLoopEnabled) {
@@ -290,6 +321,8 @@ String nextTriggerLabel() {
   time_t next = nextScheduleTime();
   if (next == 0) return "keine";
   if (!timeSynced) return "Zeit fehlt";
+
+  if (manualPlanStartAt == 0) return "Plan bereit";
 
   time_t now = time(nullptr);
   if (next <= now) return "faellig";
@@ -487,6 +520,14 @@ const char* flowStateName() {
       return "after_enter_wait";
     case FLOW_AUTO_STANDBY:
       return "auto_standby";
+    case FLOW_MANUAL_START_WAIT:
+      return "manual_start_wait";
+    case FLOW_MANUAL_AFTER_CLICK_WAIT:
+      return "manual_after_click_wait";
+    case FLOW_MANUAL_EVENT_WAIT:
+      return "manual_event_wait";
+    case FLOW_MANUAL_GAP_WAIT:
+      return "manual_gap_wait";
   }
 
   return "unknown";
@@ -526,9 +567,11 @@ void showNextDisplayPage() {
 // Bricht einen laufenden Flow ab und schaltet die Automatik aus.
 void stopFlowAndAuto() {
   autoLoopEnabled = false;
+  manualPlanStartAt = 0;
   flowState = FLOW_IDLE;
   stateUntil = 0;
   saveSettings();
+  saveSchedules();
   displayDirty = true;
 }
 
@@ -589,6 +632,10 @@ void saveSettings() {
   Settings.putString("ssid", wifiSsid);
   Settings.putString("pass", wifiPassword);
   Settings.putBool("auto", autoLoopEnabled);
+  Settings.putInt("planclock", plannerUntilSeconds);
+  Settings.putUInt("planmin", plannerMinMinutes);
+  Settings.putUInt("planmax", plannerMaxMinutes);
+  Settings.putUInt("planevents", plannerEventCount);
 }
 
 void loadSettings() {
@@ -596,6 +643,11 @@ void loadSettings() {
   wifiSsid = Settings.getString("ssid", "");
   wifiPassword = Settings.getString("pass", "");
   autoLoopEnabled = Settings.getBool("auto", false);
+  plannerUntilSeconds = Settings.getInt("planclock", -1);
+  if (plannerUntilSeconds < 0 || plannerUntilSeconds >= 86400) plannerUntilSeconds = -1;
+  plannerMinMinutes = constrain(Settings.getUInt("planmin", 15), 1U, 1440U);
+  plannerMaxMinutes = constrain(Settings.getUInt("planmax", 44), (uint32_t)plannerMinMinutes, 1440U);
+  plannerEventCount = constrain(Settings.getUInt("planevents", 4), 1U, (uint32_t)MAX_SCHEDULES);
 }
 
 // --- Zeit (NTP) ---
@@ -655,10 +707,12 @@ void saveSchedules() {
     }
   }
   Settings.putString("sched", serialized);
+  Settings.putULong("planstart", (uint32_t)manualPlanStartAt);
 }
 
 void loadSchedules() {
   for (uint8_t i = 0; i < MAX_SCHEDULES; i++) schedules[i] = 0;
+  manualPlanStartAt = (time_t)Settings.getULong("planstart", 0);
 
   String serialized = Settings.getString("sched", "");
   uint8_t idx = 0;
@@ -699,6 +753,32 @@ bool removeSchedule(time_t when) {
   return removed;
 }
 
+bool replaceSchedules(time_t* values, uint8_t count) {
+  if (count == 0 || count > MAX_SCHEDULES) return false;
+
+  // Aufsteigend sortieren, damit Anzeige und Abarbeitung dieselbe Reihenfolge haben.
+  for (uint8_t i = 1; i < count; i++) {
+    time_t value = values[i];
+    int8_t j = i - 1;
+    while (j >= 0 && values[j] > value) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = value;
+  }
+
+  for (uint8_t i = 1; i < count; i++) {
+    if (values[i] == values[i - 1]) return false;
+  }
+
+  for (uint8_t i = 0; i < MAX_SCHEDULES; i++) {
+    schedules[i] = i < count ? values[i] : 0;
+  }
+  saveSchedules();
+  displayDirty = true;
+  return true;
+}
+
 void beginAutoStandby() {
   uint32_t waitMs = random(LONG_WAIT_MIN_MS, LONG_WAIT_MAX_MS + 1);
 
@@ -709,8 +789,43 @@ void beginAutoStandby() {
   Serial.printf("Auto-Standby fuer %lu ms\n", (unsigned long)waitMs);
 }
 
+void finishManualPlan() {
+  manualPlanStartAt = 0;
+  flowState = FLOW_IDLE;
+  stateUntil = 0;
+  saveSchedules();
+  displayDirty = true;
+  Serial.println("Geplante manuelle Sequenz abgeschlossen");
+}
+
+void startManualPreparation() {
+  lastTrigger = "schedule";
+  leftClick();
+  flowState = FLOW_MANUAL_AFTER_CLICK_WAIT;
+  stateUntil = millis() + AFTER_CLICK_WAIT;
+  displayDirty = true;
+  Serial.println("Manuelle Sequenz: Linksklick gesendet");
+}
+
+bool armManualPlan(time_t startAt) {
+  if (flowState != FLOW_IDLE || autoLoopEnabled || nextScheduleTime() == 0) return false;
+
+  time_t now = time(nullptr);
+  manualPlanStartAt = startAt <= now ? now : startAt;
+  flowState = FLOW_MANUAL_START_WAIT;
+  stateUntil = 0;
+  nextJiggleAt = millis() + JIGGLE_INTERVAL;
+  lastTrigger = "schedule";
+  saveSchedules();
+  displayDirty = true;
+  Serial.printf("Manuelle Sequenz geplant ab: %s\n", formatTime(manualPlanStartAt).c_str());
+  return true;
+}
+
 bool startFlow(const String& source) {
-  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT) {
+  if (flowState == FLOW_AFTER_CLICK_WAIT || flowState == FLOW_AFTER_ENTER_WAIT ||
+      flowState == FLOW_MANUAL_START_WAIT || flowState == FLOW_MANUAL_AFTER_CLICK_WAIT ||
+      flowState == FLOW_MANUAL_EVENT_WAIT || flowState == FLOW_MANUAL_GAP_WAIT) {
     return false;
   }
 
@@ -724,6 +839,12 @@ bool startFlow(const String& source) {
 
 void handleFlow() {
   if (flowState == FLOW_IDLE) {
+    if (manualPlanStartAt != 0) {
+      flowState = FLOW_MANUAL_START_WAIT;
+      displayDirty = true;
+      return;
+    }
+
     if (autoLoopEnabled) {
       startFlow("auto");
       return;
@@ -775,11 +896,83 @@ void handleFlow() {
     if (timeReached(stateUntil)) {
       startFlow("auto");
     }
+    return;
+  }
+
+  if (flowState == FLOW_MANUAL_START_WAIT) {
+    if (nextScheduleTime() == 0) {
+      finishManualPlan();
+      return;
+    }
+
+    if (!timeSynced || time(nullptr) < manualPlanStartAt) {
+      if (timeReached(nextJiggleAt)) {
+        jiggleOnce();
+        nextJiggleAt = millis() + JIGGLE_INTERVAL;
+      }
+      return;
+    }
+
+    startManualPreparation();
+    return;
+  }
+
+  if (flowState == FLOW_MANUAL_AFTER_CLICK_WAIT) {
+    if (timeReached(stateUntil)) {
+      Keyboard.write(KEY_RETURN);
+      flowState = FLOW_MANUAL_EVENT_WAIT;
+      nextJiggleAt = millis() + JIGGLE_INTERVAL;
+      displayDirty = true;
+      Serial.println("Manuelle Sequenz: ENTER gesendet, warte auf Event");
+    }
+    return;
+  }
+
+  if (flowState == FLOW_MANUAL_EVENT_WAIT) {
+    time_t next = nextScheduleTime();
+    if (next == 0) {
+      finishManualPlan();
+      return;
+    }
+
+    time_t now = time(nullptr);
+    if (timeSynced && now >= next) {
+      if (now - next > SCHEDULE_GRACE_S) {
+        Serial.printf("Geplantes Event verfallen: %s\n", formatTime(next).c_str());
+        removeSchedule(next);
+        return;
+      }
+
+      pressCtrlAltF();
+      Serial.printf("Geplantes Event ausgefuehrt: %s\n", formatTime(next).c_str());
+      removeSchedule(next);
+
+      if (nextScheduleTime() == 0) {
+        finishManualPlan();
+      } else {
+        uint32_t gapMs = random(MANUAL_GAP_MIN_MS, MANUAL_GAP_MAX_MS + 1);
+        flowState = FLOW_MANUAL_GAP_WAIT;
+        stateUntil = millis() + gapMs;
+        displayDirty = true;
+        Serial.printf("Naechste Vorbereitung in %lu ms\n", (unsigned long)gapMs);
+      }
+      return;
+    }
+
+    if (timeReached(nextJiggleAt)) {
+      jiggleOnce();
+      nextJiggleAt = millis() + JIGGLE_INTERVAL;
+    }
+    return;
+  }
+
+  if (flowState == FLOW_MANUAL_GAP_WAIT) {
+    if (timeReached(stateUntil)) startManualPreparation();
   }
 }
 
 void checkSchedules() {
-  if (!timeSynced) return;
+  if (!timeSynced || manualPlanStartAt != 0) return;
 
   time_t now = time(nullptr);
   for (uint8_t i = 0; i < MAX_SCHEDULES; i++) {
@@ -793,12 +986,8 @@ void checkSchedules() {
       continue;
     }
 
-    if (startFlow("schedule")) {
-      Serial.printf("Geplante Ausloesung gestartet: %s\n", formatTime(schedules[i]).c_str());
-      schedules[i] = 0;
-      saveSchedules();
-    }
-    break;  // pro Durchlauf nur eine Auslösung
+    // Ohne gestartete manuelle Sequenz bleiben faellige Events innerhalb
+    // der Nachholfrist bestehen. Sie werden beim Start des Plans verarbeitet.
   }
 }
 
@@ -919,6 +1108,12 @@ String statusJson() {
   json += "\"ok\":true";
   json += ",\"flowState\":\"" + String(flowStateName()) + "\"";
   json += ",\"autoLoopEnabled\":" + String(autoLoopEnabled ? "true" : "false");
+  json += ",\"manualPlanActive\":" + String(manualPlanStartAt != 0 ? "true" : "false");
+  json += ",\"manualStartAt\":" + String((uint32_t)manualPlanStartAt);
+  json += ",\"plannerUntilSeconds\":" + String(plannerUntilSeconds);
+  json += ",\"plannerMinMinutes\":" + String(plannerMinMinutes);
+  json += ",\"plannerMaxMinutes\":" + String(plannerMaxMinutes);
+  json += ",\"plannerEventCount\":" + String(plannerEventCount);
   json += ",\"lastTrigger\":\"" + jsonEscape(lastTrigger) + "\"";
   json += ",\"apSsid\":\"" + String(AP_SSID) + "\"";
   json += ",\"apIp\":\"" + WiFi.softAPIP().toString() + "\"";
@@ -1310,6 +1505,71 @@ String indexHtml() {
       border-color: var(--primary);
     }
 
+    .planner-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .planner-field { min-width: 0; }
+    .planner-field.wide-field { grid-column: span 2; }
+    .planner-field label { margin-top: 0; }
+
+    .planner-field input,
+    .suggestion-row input {
+      width: 100%;
+      min-height: 46px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 10px 12px;
+      font: inherit;
+      font-size: 16px;
+    }
+
+    .planner-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    dialog {
+      width: min(620px, calc(100% - 24px));
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      border: 0;
+      border-radius: 12px;
+      padding: 22px;
+      color: var(--text);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    dialog::backdrop { background: rgba(19, 32, 37, 0.58); }
+    dialog h2 { margin-bottom: 8px; }
+
+    .suggestion-list {
+      display: grid;
+      gap: 9px;
+      margin: 18px 0;
+    }
+
+    .suggestion-row {
+      display: grid;
+      grid-template-columns: 74px minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+    }
+
+    .suggestion-row span {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
     .schedule-list {
       display: grid;
       gap: 8px;
@@ -1352,11 +1612,14 @@ String indexHtml() {
       .clock-card { text-align: left; }
       .status-grid { grid-template-columns: 1fr 1fr; }
       .content { grid-template-columns: 1fr; }
+      .planner-grid { grid-template-columns: 1fr 1fr; }
+      .planner-field.wide-field { grid-column: span 2; }
       section, section:nth-child(odd) {
         padding: 18px;
         border-right: 0;
       }
       .actions { grid-template-columns: 1fr; }
+      .planner-actions button { flex: 1 1 100%; }
       .form-actions, .form-actions button { width: 100%; }
     }
 
@@ -1443,7 +1706,35 @@ String indexHtml() {
 
         <section class="wide">
           <h2>Geplante Auslösung</h2>
-          <p class="muted">Lege Zeitpunkte fest, an denen der Flow einmalig automatisch startet. Benötigt eine synchronisierte Gerätezeit.</p>
+          <p class="muted">Die manuelle Sequenz beginnt ab dem Startzeitpunkt mit Linksklick und Enter. Zu jedem Event folgt Strg+Alt+F. Vor weiteren Events wird nach 10–30 Sekunden erneut mit Linksklick und Enter vorbereitet.</p>
+          <div class="planner-grid">
+            <div class="planner-field wide-field">
+              <label for="manualStartInput">Start ab</label>
+              <input id="manualStartInput" type="datetime-local" step="1" aria-label="Startzeitpunkt der manuellen Sequenz">
+            </div>
+            <div class="planner-field wide-field">
+              <label for="manualUntilInput">Bis Uhrzeit</label>
+              <input id="manualUntilInput" type="time" step="1" onchange="savePlannerSettings()" aria-label="Spaeteste Event-Uhrzeit">
+            </div>
+            <div class="planner-field">
+              <label for="eventCountInput">Events</label>
+              <input id="eventCountInput" type="number" min="1" max="8" value="4" onchange="savePlannerSettings()">
+            </div>
+            <div class="planner-field">
+              <label for="minDurationInput">Min. Dauer (Min.)</label>
+              <input id="minDurationInput" type="number" min="1" value="15" onchange="savePlannerSettings()" aria-label="Minimale Dauer in Minuten">
+            </div>
+            <div class="planner-field">
+              <label for="maxDurationInput">Max. Dauer (Min.)</label>
+              <input id="maxDurationInput" type="number" min="1" value="44" onchange="savePlannerSettings()" aria-label="Maximale Dauer in Minuten">
+            </div>
+          </div>
+          <div class="planner-actions">
+            <button id="calculateEventsButton" type="button" onclick="calculateSuggestions()">Events berechnen</button>
+            <button id="planStartButton" type="button" onclick="startManualPlan()">Sequenz starten</button>
+          </div>
+          <p id="planState" class="muted">Noch nicht gestartet.</p>
+          <label for="scheduleInput">Event hinzufügen</label>
           <div class="schedule-add">
             <input id="scheduleInput" type="datetime-local" aria-label="Zeitpunkt für Auslösung">
             <button type="button" onclick="addSchedule()">Hinzufügen</button>
@@ -1477,13 +1768,26 @@ String indexHtml() {
             <p><code>GET /api/status</code> Status lesen.</p>
             <p><code>POST /api/settings?auto=1</code> Auto ein.</p>
             <p><code>POST /api/settings?auto=0</code> Auto aus.</p>
-            <p><code>POST /api/schedule?when=2026-06-01T14:30</code> Auslösung planen.</p>
+            <p><code>POST /api/planner/settings</code> Planerwerte dauerhaft speichern.</p>
+            <p><code>POST /api/schedule?when=2026-06-01T14:30</code> Event planen.</p>
+            <p><code>POST /api/schedule/replace</code> Berechnete Eventliste übernehmen.</p>
+            <p><code>POST /api/schedule/start?when=2026-06-01T13:55:00</code> Manuelle Sequenz starten.</p>
             <p><code>POST /api/schedule/delete?when=EPOCH</code> Auslösung löschen.</p>
           </div>
         </section>
       </div>
     </div>
   </main>
+
+  <dialog id="suggestionModal" aria-labelledby="suggestionTitle">
+    <h2 id="suggestionTitle">Event-Vorschläge</h2>
+    <p id="suggestionHint" class="muted">Die berechneten Zeiten können vor dem Übernehmen angepasst werden.</p>
+    <div id="suggestionList" class="suggestion-list"></div>
+    <div class="planner-actions">
+      <button class="secondary" type="button" onclick="closeSuggestionModal()">Abbrechen</button>
+      <button id="applySuggestionsButton" type="button" onclick="applySuggestions()">Vorschläge übernehmen</button>
+    </div>
+  </dialog>
 
   <script>
     const triggerButton = document.getElementById('triggerButton');
@@ -1572,7 +1876,11 @@ String indexHtml() {
       idle: { label: 'Bereit', dot: 'idle' },
       after_click_wait: { label: 'Klick gesendet – warte …', dot: 'running' },
       after_enter_wait: { label: 'Enter gesendet – warte …', dot: 'running' },
-      auto_standby: { label: 'Standby (Automatik)', dot: 'standby' }
+      auto_standby: { label: 'Standby (Automatik)', dot: 'standby' },
+      manual_start_wait: { label: 'Manueller Start geplant', dot: 'standby' },
+      manual_after_click_wait: { label: 'Manuell: Klick gesendet', dot: 'running' },
+      manual_event_wait: { label: 'Manuell: warte auf Event', dot: 'standby' },
+      manual_gap_wait: { label: 'Manuell: nächste Vorbereitung', dot: 'running' }
     };
 
     const WEEKDAYS = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
@@ -1582,8 +1890,42 @@ String indexHtml() {
     let fetchedAt = 0;
     let timeSynced = false;
     let schedules = [];
+    let manualPlanActive = false;
+    let manualStartAt = 0;
+    let maxSchedules = 8;
+    let suggestionConfig = null;
+    let plannerSettingsLoaded = false;
 
     function pad(n) { return String(n).padStart(2, '0'); }
+
+    function localInputValue(epochMs, withSeconds = true) {
+      const local = new Date(epochMs - new Date(epochMs).getTimezoneOffset() * 60000);
+      return local.toISOString().slice(0, withSeconds ? 19 : 16);
+    }
+
+    function timeInputSeconds(value) {
+      const parts = String(value || '').split(':').map(Number);
+      if (parts.length < 2 || parts.some(part => !Number.isFinite(part))) return -1;
+      return parts[0] * 3600 + parts[1] * 60 + (parts[2] || 0);
+    }
+
+    function timeInputValue(seconds) {
+      const hours = Math.floor(seconds / 3600) % 24;
+      const minutes = Math.floor(seconds / 60) % 60;
+      const secs = seconds % 60;
+      return pad(hours) + ':' + pad(minutes) + ':' + pad(secs);
+    }
+
+    function untilEpochMs(startMs, untilSeconds) {
+      const result = new Date(startMs);
+      result.setHours(Math.floor(untilSeconds / 3600), Math.floor(untilSeconds / 60) % 60, untilSeconds % 60, 0);
+      if (result.getTime() <= startMs) result.setDate(result.getDate() + 1);
+      return result.getTime();
+    }
+
+    function randomInt(min, max) {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
 
     function nowEpochMs() {
       if (!serverEpoch) return Date.now();
@@ -1632,6 +1974,184 @@ String indexHtml() {
       el.textContent = future.length ? 'in ' + fmtDuration(future[0].when * 1000 - now) : '–';
     }
 
+    function renderPlanState() {
+      const state = document.getElementById('planState');
+      const button = document.getElementById('planStartButton');
+      const calculateButton = document.getElementById('calculateEventsButton');
+      if (manualPlanActive) {
+        state.textContent = 'Sequenz aktiv – Start: ' + fmtStamp(manualStartAt);
+        button.disabled = true;
+        calculateButton.disabled = true;
+        button.textContent = 'Sequenz läuft';
+      } else {
+        state.textContent = schedules.length ? 'Events bereit. Startzeit festlegen und Sequenz starten.' : 'Zuerst mindestens ein Event hinzufügen.';
+        button.disabled = schedules.length === 0 || !timeSynced;
+        calculateButton.disabled = !timeSynced;
+        button.textContent = 'Sequenz starten';
+      }
+    }
+
+    async function savePlannerSettings() {
+      const untilSeconds = timeInputSeconds(document.getElementById('manualUntilInput').value);
+      const minMinutes = Number(document.getElementById('minDurationInput').value);
+      const maxMinutes = Number(document.getElementById('maxDurationInput').value);
+      const eventCount = Number(document.getElementById('eventCountInput').value);
+
+      if (untilSeconds < 0 || untilSeconds >= 86400 || !Number.isInteger(minMinutes) || !Number.isInteger(maxMinutes) ||
+          !Number.isInteger(eventCount) || minMinutes < 1 || maxMinutes < minMinutes ||
+          maxMinutes > 1440 || eventCount < 1 || eventCount > maxSchedules) {
+        setMessage('Planerwerte konnten noch nicht gespeichert werden.', true);
+        return false;
+      }
+
+      try {
+        const body = new URLSearchParams({
+          until: String(untilSeconds),
+          min: String(minMinutes),
+          max: String(maxMinutes),
+          events: String(eventCount)
+        });
+        const response = await fetch('/api/planner/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Speichern fehlgeschlagen');
+        setMessage('Planerwerte gespeichert.', false);
+        return true;
+      } catch (error) {
+        setMessage('Planerwerte konnten nicht gespeichert werden.', true);
+        return false;
+      }
+    }
+
+    function calculateSuggestions() {
+      const startMs = new Date(document.getElementById('manualStartInput').value).getTime();
+      const untilSeconds = timeInputSeconds(document.getElementById('manualUntilInput').value);
+      const untilMs = Number.isFinite(startMs) && untilSeconds >= 0
+        ? untilEpochMs(startMs, untilSeconds)
+        : NaN;
+      const count = Number(document.getElementById('eventCountInput').value);
+      const minMinutes = Number(document.getElementById('minDurationInput').value);
+      const maxMinutes = Number(document.getElementById('maxDurationInput').value);
+
+      if (!Number.isFinite(startMs) || !Number.isFinite(untilMs)) {
+        setMessage('Start und „Bis Uhrzeit“ sind ungültig.', true);
+        return;
+      }
+      if (!Number.isInteger(count) || count < 1 || count > maxSchedules) {
+        setMessage('Die Eventanzahl muss zwischen 1 und ' + maxSchedules + ' liegen.', true);
+        return;
+      }
+      if (!Number.isFinite(minMinutes) || !Number.isFinite(maxMinutes) ||
+          minMinutes < 1 || maxMinutes < minMinutes) {
+        setMessage('Minimale und maximale Dauer sind ungültig.', true);
+        return;
+      }
+
+      const minSeconds = Math.round(minMinutes * 60);
+      const maxSeconds = Math.round(maxMinutes * 60);
+      const windowSeconds = Math.floor((untilMs - startMs) / 1000);
+      const minimumSpan = count * minSeconds;
+      const maximumSpan = Math.min(windowSeconds, count * maxSeconds);
+
+      if (windowSeconds < minimumSpan) {
+        setMessage('Der Zeitraum ist zu kurz: Für ' + count + ' Events werden mindestens ' +
+                   fmtDuration(minimumSpan * 1000) + ' benötigt.', true);
+        return;
+      }
+
+      savePlannerSettings();
+
+      // Zuerst eine zufällige Gesamtdauer wählen, anschließend diese so aufteilen,
+      // dass jeder Abstand weiterhin innerhalb der Min-/Max-Grenzen liegt.
+      let remaining = randomInt(minimumSpan, maximumSpan);
+      let cursorMs = startMs;
+      const suggestions = [];
+      for (let i = 0; i < count; i++) {
+        const slotsAfter = count - i - 1;
+        const low = Math.max(minSeconds, remaining - slotsAfter * maxSeconds);
+        const high = Math.min(maxSeconds, remaining - slotsAfter * minSeconds);
+        const gap = i === count - 1 ? remaining : randomInt(low, high);
+        cursorMs += gap * 1000;
+        suggestions.push(cursorMs);
+        remaining -= gap;
+      }
+
+      suggestionConfig = { startMs, untilMs, minSeconds, maxSeconds };
+      const list = document.getElementById('suggestionList');
+      list.innerHTML = suggestions.map((value, index) =>
+        '<label class="suggestion-row">' +
+          '<span>Event ' + (index + 1) + '</span>' +
+          '<input class="suggestion-input" type="datetime-local" step="1" value="' + localInputValue(value) + '">' +
+        '</label>'
+      ).join('');
+
+      document.getElementById('suggestionHint').textContent =
+        'Zufällig verteilt mit ' + minMinutes + '–' + maxMinutes + ' Minuten Abstand. ' +
+        'Letzter Vorschlag: ' + fmtStamp(Math.floor(suggestions[suggestions.length - 1] / 1000)) + '.';
+      document.getElementById('suggestionHint').style.color = '';
+      document.getElementById('suggestionModal').showModal();
+      setMessage('', false);
+    }
+
+    function closeSuggestionModal() {
+      document.getElementById('suggestionModal').close();
+    }
+
+    async function applySuggestions() {
+      if (!suggestionConfig) return;
+      const inputs = Array.from(document.querySelectorAll('.suggestion-input'));
+      const values = inputs.map(input => new Date(input.value).getTime()).sort((a, b) => a - b);
+      if (values.some(value => !Number.isFinite(value))) {
+        const hint = document.getElementById('suggestionHint');
+        hint.textContent = 'Mindestens ein Vorschlag enthält keine gültige Zeit.';
+        hint.style.color = 'var(--danger)';
+        return;
+      }
+
+      let previous = suggestionConfig.startMs;
+      for (const value of values) {
+        const gapSeconds = Math.round((value - previous) / 1000);
+        if (value > suggestionConfig.untilMs || gapSeconds < suggestionConfig.minSeconds ||
+            gapSeconds > suggestionConfig.maxSeconds) {
+          const hint = document.getElementById('suggestionHint');
+          hint.textContent = 'Angepasste Zeiten müssen innerhalb von „Bis Uhrzeit“ und den Min-/Max-Abständen bleiben.';
+          hint.style.color = 'var(--danger)';
+          return;
+        }
+        previous = value;
+      }
+
+      const button = document.getElementById('applySuggestionsButton');
+      button.disabled = true;
+      try {
+        const body = new URLSearchParams({
+          times: values.map(value => Math.floor(value / 1000)).join(',')
+        });
+        const response = await fetch('/api/schedule/replace', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          const hint = document.getElementById('suggestionHint');
+          hint.textContent = data.error || 'Vorschläge konnten nicht übernommen werden.';
+          hint.style.color = 'var(--danger)';
+        } else {
+          applyStatus(data);
+          closeSuggestionModal();
+          setMessage('Event-Vorschläge übernommen.', false);
+        }
+      } catch (error) {
+        setMessage('Keine Verbindung zum Geraet.', true);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
     function renderSchedules() {
       const list = document.getElementById('scheduleList');
       const empty = document.getElementById('scheduleEmpty');
@@ -1659,6 +2179,19 @@ String indexHtml() {
       fetchedAt = Date.now();
       timeSynced = !!data.timeSynced;
       schedules = data.schedules || [];
+      manualPlanActive = !!data.manualPlanActive;
+      manualStartAt = data.manualStartAt || 0;
+      maxSchedules = data.maxSchedules || 8;
+      document.getElementById('eventCountInput').max = maxSchedules;
+      if (!plannerSettingsLoaded) {
+        if (data.plannerUntilSeconds >= 0) {
+          document.getElementById('manualUntilInput').value = timeInputValue(data.plannerUntilSeconds);
+        }
+        document.getElementById('minDurationInput').value = data.plannerMinMinutes || 15;
+        document.getElementById('maxDurationInput').value = data.plannerMaxMinutes || 44;
+        document.getElementById('eventCountInput').value = data.plannerEventCount || 4;
+        plannerSettingsLoaded = true;
+      }
 
       const info = FLOW_INFO[data.flowState] || { label: data.flowState, dot: 'idle' };
       document.getElementById('flowState').textContent = info.label;
@@ -1675,6 +2208,7 @@ String indexHtml() {
 
       renderSchedules();
       renderNextTrigger();
+      renderPlanState();
     }
 
     async function refreshStatus() {
@@ -1698,8 +2232,26 @@ String indexHtml() {
           setMessage(data.error || 'Konnte nicht gespeichert werden.', true);
         } else {
           setMessage('Auslösung geplant.', false);
-          input.value = '';
           applyStatus(data);
+        }
+      } catch (error) {
+        setMessage('Keine Verbindung zum Geraet.', true);
+      }
+    }
+
+    async function startManualPlan() {
+      const input = document.getElementById('manualStartInput');
+      if (!input.value) { setMessage('Bitte einen Startzeitpunkt wählen.', true); return; }
+
+      setMessage('Manuelle Sequenz wird geplant …', false);
+      try {
+        const response = await fetch('/api/schedule/start?when=' + encodeURIComponent(input.value), { method: 'POST' });
+        const data = await response.json();
+        if (!data.ok) {
+          setMessage(data.error || 'Sequenz konnte nicht gestartet werden.', true);
+        } else {
+          applyStatus(data);
+          setMessage('Manuelle Sequenz gestartet.', false);
         }
       } catch (error) {
         setMessage('Keine Verbindung zum Geraet.', true);
@@ -1717,11 +2269,15 @@ String indexHtml() {
     }
 
     function initScheduleInput() {
-      const input = document.getElementById('scheduleInput');
-      const soon = new Date(Date.now() + 5 * 60000 - new Date().getTimezoneOffset() * 60000);
-      const now = new Date(Date.now() - new Date().getTimezoneOffset() * 60000);
-      input.min = now.toISOString().slice(0, 16);
-      input.value = soon.toISOString().slice(0, 16);
+      const eventInput = document.getElementById('scheduleInput');
+      const startInput = document.getElementById('manualStartInput');
+      const untilInput = document.getElementById('manualUntilInput');
+      eventInput.min = localInputValue(Date.now(), false);
+      eventInput.value = localInputValue(Date.now() + 5 * 60000, false);
+      startInput.min = localInputValue(Date.now());
+      startInput.value = localInputValue(Date.now());
+      const defaultUntil = new Date(Date.now() + 3 * 60 * 60 * 1000);
+      untilInput.value = timeInputValue(defaultUntil.getHours() * 3600 + defaultUntil.getMinutes() * 60 + defaultUntil.getSeconds());
     }
 
     let pollTimer = null;
@@ -1862,6 +2418,13 @@ void handleSettings() {
     autoLoopEnabled = false;
   }
 
+  if (autoLoopEnabled && manualPlanStartAt != 0) {
+    manualPlanStartAt = 0;
+    flowState = FLOW_IDLE;
+    stateUntil = 0;
+    saveSchedules();
+  }
+
   saveSettings();
 
   if (autoLoopEnabled && flowState == FLOW_IDLE) {
@@ -1873,6 +2436,55 @@ void handleSettings() {
   } else {
     redirectHome();
   }
+}
+
+void handlePlannerSettings() {
+  int32_t untilSeconds = Server.arg("until").toInt();
+  uint32_t minMinutes = (uint32_t)Server.arg("min").toInt();
+  uint32_t maxMinutes = (uint32_t)Server.arg("max").toInt();
+  uint32_t eventCount = (uint32_t)Server.arg("events").toInt();
+
+  if (!Server.hasArg("until") || untilSeconds < 0 || untilSeconds >= 86400 ||
+      minMinutes < 1 || maxMinutes < minMinutes || maxMinutes > 1440 ||
+      eventCount < 1 || eventCount > MAX_SCHEDULES) {
+    Server.send(400, "application/json", "{\"ok\":false,\"error\":\"ungueltige planerwerte\"}");
+    return;
+  }
+
+  plannerUntilSeconds = untilSeconds;
+  plannerMinMinutes = minMinutes;
+  plannerMaxMinutes = maxMinutes;
+  plannerEventCount = eventCount;
+  saveSettings();
+  Server.send(200, "application/json", statusJson());
+}
+
+void handleManualPlanStart() {
+  if (!timeSynced) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"zeit noch nicht synchronisiert\"}");
+    return;
+  }
+  if (autoLoopEnabled) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"automatik zuerst ausschalten\"}");
+    return;
+  }
+  if (nextScheduleTime() == 0) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"keine events geplant\"}");
+    return;
+  }
+
+  String startStr = Server.arg("when");
+  time_t startAt = startStr.indexOf('-') >= 0
+    ? parseLocalDateTime(startStr)
+    : (time_t)strtoul(startStr.c_str(), nullptr, 10);
+  if (startAt <= 0) startAt = time(nullptr);
+
+  if (!armManualPlan(startAt)) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"flow bereits aktiv\"}");
+    return;
+  }
+
+  Server.send(200, "application/json", statusJson());
 }
 
 void handleScheduleAdd() {
@@ -1908,6 +2520,51 @@ void handleScheduleDelete() {
   Server.send(200, "application/json", statusJson());
 }
 
+void handleScheduleReplace() {
+  if (!timeSynced) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"zeit noch nicht synchronisiert\"}");
+    return;
+  }
+  if (manualPlanStartAt != 0) {
+    Server.send(409, "application/json", "{\"ok\":false,\"error\":\"manuelle sequenz bereits aktiv\"}");
+    return;
+  }
+
+  String serialized = Server.arg("times");
+  time_t values[MAX_SCHEDULES];
+  uint8_t count = 0;
+  int start = 0;
+  time_t now = time(nullptr);
+
+  while (start <= (int)serialized.length()) {
+    if (count >= MAX_SCHEDULES) {
+      Server.send(400, "application/json", "{\"ok\":false,\"error\":\"zu viele events\"}");
+      return;
+    }
+    int comma = serialized.indexOf(',', start);
+    String part = comma < 0 ? serialized.substring(start) : serialized.substring(start, comma);
+    part.trim();
+    if (part.length()) {
+      time_t value = (time_t)strtoul(part.c_str(), nullptr, 10);
+      if (value <= now) {
+        Server.send(400, "application/json", "{\"ok\":false,\"error\":\"event liegt nicht in der zukunft\"}");
+        return;
+      }
+      values[count++] = value;
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+
+  if (count == 0 || !replaceSchedules(values, count)) {
+    Server.send(400, "application/json", "{\"ok\":false,\"error\":\"ungueltige oder doppelte events\"}");
+    return;
+  }
+
+  Serial.printf("Event-Vorschlaege uebernommen: %u\n", count);
+  Server.send(200, "application/json", statusJson());
+}
+
 void handleWifiSave() {
   wifiSsid = Server.arg("ssid");
   wifiPassword = Server.arg("pass");
@@ -1935,11 +2592,15 @@ void setupRoutes() {
   Server.on("/api/click", HTTP_POST, handleMouseClick);
   Server.on("/api/click", HTTP_GET, handleMouseClick);
   Server.on("/api/settings", HTTP_POST, handleSettings);
+  Server.on("/api/planner/settings", HTTP_POST, handlePlannerSettings);
   Server.on("/settings", HTTP_POST, handleSettings);
   Server.on("/api/schedule", HTTP_POST, handleScheduleAdd);
   Server.on("/api/schedule", HTTP_GET, handleScheduleAdd);
+  Server.on("/api/schedule/start", HTTP_POST, handleManualPlanStart);
+  Server.on("/api/schedule/start", HTTP_GET, handleManualPlanStart);
   Server.on("/api/schedule/delete", HTTP_POST, handleScheduleDelete);
   Server.on("/api/schedule/delete", HTTP_GET, handleScheduleDelete);
+  Server.on("/api/schedule/replace", HTTP_POST, handleScheduleReplace);
   Server.on("/api/wifi", HTTP_POST, handleWifiSave);
   Server.on("/wifi", HTTP_POST, handleWifiSave);
   Server.onNotFound([]() {
@@ -1959,6 +2620,10 @@ void setup() {
 
   loadSettings();
   loadSchedules();
+  if (manualPlanStartAt != 0 && autoLoopEnabled) {
+    autoLoopEnabled = false;
+    saveSettings();
+  }
   connectWifi();
   updateDisplay("Netz bereit");
   setupRoutes();

@@ -13,12 +13,12 @@ ESP32-S3/Arduino-Sketch fuer eine USB-HID Maus- und Tastatursteuerung auf dem Li
 - Lokale, mobilfreundliche Website ohne externe JS-/CSS-Abhaengigkeiten
 - Flow per Website oder API ausloesen
 - Automatische Schleife ein- und ausschaltbar
-- Geplante Einmal-Auslösungen zu festen Zeitpunkten (persistent gespeichert)
+- Geplante manuelle Sequenzen mit frei waehlbarem Start und festen Event-Zeitpunkten (persistent gespeichert)
 - Zeitsynchronisation per NTP beim Start (Zeitzone Mitteleuropa, inkl. Sommerzeit)
 - Live-Statusanzeige mit Gerätezeit, Flow-Zustand und Countdown zur nächsten Auslösung
 - Manuelle Maussteuerung per Pfeiltasten auf der Website
 - Manueller Linksklick per Website oder API
-- Bildschirm-Wachhalten auch im Leerlauf (Maus bewegt sich alle 10 Minuten minimal um 1 Pixel links/rechts)
+- Bildschirm-Wachhalten auch im Leerlauf (Maus bewegt sich alle 5 Minuten minimal um 2 Pixel links/rechts)
 
 ## Ablauf
 
@@ -39,11 +39,23 @@ Der Flow macht:
 
 Wenn die automatische Schleife aktiv ist, wartet der Sketch nach jedem Flow zufaellig 25 bis 35 Minuten und startet dann erneut.
 
-Auch im Leerlauf (Automatik aus) bewegt sich die Maus alle 10 Minuten nur um 1 Pixel nach links und direkt wieder zurueck, damit der Bildschirm wach bleibt, ohne dass man die Bewegung praktisch bemerkt.
+Auch im Leerlauf (Automatik aus) bewegt sich die Maus alle 5 Minuten nur um 2 Pixel nach links und direkt wieder zurueck, damit der Bildschirm wach bleibt, ohne dass man die Bewegung praktisch bemerkt.
 
-## Geplante Auslösung
+## Geplante manuelle Sequenz
 
-Auf der Website lassen sich unter „Geplante Auslösung" feste Zeitpunkte festlegen, an denen der Flow einmalig automatisch startet (bis zu 8 Einträge). Voraussetzung ist eine synchronisierte Gerätezeit – diese wird beim Start per NTP geholt, sobald eine Heimnetz-Verbindung besteht. Die Zeitpunkte werden persistent gespeichert und nach einer Auslösung automatisch entfernt. Verpasste Zeitpunkte (z. B. weil das Geraet aus war) werden bis zu eine Stunde spaeter nachgeholt, danach verfallen sie.
+Auf der Website lassen sich unter „Geplante Auslösung" bis zu 8 feste Event-Zeitpunkte und ein Zeitpunkt „Start ab" festlegen. „Start ab" ist standardmaessig auf die aktuelle Zeit gesetzt. Voraussetzung ist eine synchronisierte Gerätezeit – diese wird beim Start per NTP geholt, sobald eine Heimnetz-Verbindung besteht.
+
+Alternativ berechnet die Weboberflaeche die Event-Zeitpunkte automatisch. Dazu werden „Bis Uhrzeit", die Eventanzahl sowie minimale und maximale Dauer zwischen Start/Event beziehungsweise zwei Events angegeben. Die Vorgaben sind 15 Minuten Minimum und 44 Minuten Maximum. „Events berechnen" erzeugt zufaellig verteilte Vorschlaege innerhalb dieser Grenzen. Die Vorschlaege koennen in einem Dialog angepasst und danach als neue Eventliste uebernommen werden. „Bis Uhrzeit" wird ohne Datum als reine Uhrzeit gespeichert; liegt sie beim Berechnen bereits vor „Start ab", gilt sie fuer den folgenden Tag. Uhrzeit, Eventanzahl, Minimum und Maximum werden persistent auf dem Geraet gespeichert und nach einem Neustart wiederhergestellt.
+
+Der manuelle Plan laeuft so ab:
+
+1. Ab dem Startzeitpunkt: Linksklick, 5 Sekunden warten, Enter.
+2. Bis zum ersten Event warten und dann `Strg + Alt + F` senden.
+3. Falls ein weiteres Event vorhanden ist: zufaellig 10 bis 30 Sekunden warten, erneut Linksklick, 5 Sekunden warten und Enter senden.
+4. Bis zum naechsten Event warten und den Ablauf wiederholen.
+5. Beim letzten Event endet der Plan nach `Strg + Alt + F`; es wird kein weiterer Linksklick vorbereitet.
+
+Startzeit und Events werden persistent gespeichert. Ausgefuehrte Events werden automatisch entfernt. Verpasste Events werden bis zu eine Stunde spaeter nachgeholt, danach verfallen sie.
 
 ## Weboberflaeche
 
@@ -110,10 +122,32 @@ Automatische Schleife ausschalten:
 POST /api/settings?auto=0
 ```
 
-Geplante Auslösung hinzufügen (lokale Gerätezeit, Format `YYYY-MM-DDTHH:MM`):
+Planerwerte persistent speichern (URL-kodierter POST-Body):
+
+```http
+POST /api/planner/settings
+until=63000&min=15&max=44&events=4
+```
+
+`until` sind die Sekunden seit Mitternacht; `63000` entspricht `17:30:00`.
+
+Event hinzufügen (lokale Gerätezeit, Format `YYYY-MM-DDTHH:MM`):
 
 ```http
 POST /api/schedule?when=2026-06-01T14:30
+```
+
+Berechnete Eventliste atomar ersetzen (URL-kodierter POST-Body, Epoch-Werte):
+
+```http
+POST /api/schedule/replace
+times=1780315200,1780317000,1780319100
+```
+
+Manuelle Sequenz starten; ohne `when` wird sofort gestartet:
+
+```http
+POST /api/schedule/start?when=2026-06-01T13:55:00
 ```
 
 Geplante Auslösung löschen (Epoch-Zeit wie in `/api/status` geliefert):
@@ -122,7 +156,7 @@ Geplante Auslösung löschen (Epoch-Zeit wie in `/api/status` geliefert):
 POST /api/schedule/delete?when=1780000000
 ```
 
-Das Statusobjekt aus `GET /api/status` enthaelt zusaetzlich `time` (Epoch), `timeSynced`, `maxSchedules` und die Liste `schedules` mit `when` und `label`.
+Das Statusobjekt aus `GET /api/status` enthaelt zusaetzlich `time` (Epoch), `timeSynced`, `manualPlanActive`, `manualStartAt`, die persistenten `planner...`-Werte, `maxSchedules` und die Liste `schedules` mit `when` und `label`.
 
 ## Wichtige Hinweise
 
