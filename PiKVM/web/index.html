@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PiKVM HID Automation</title>
+<style>
+:root{color-scheme:dark;background:#111;color:#eee;font-family:system-ui,sans-serif}body{margin:0;padding:20px;max-width:1000px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:16px}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}button,input{font:inherit}button{padding:10px 14px;border:0;border-radius:10px;background:#3578e5;color:white;cursor:pointer}button.alt{background:#444}button.danger{background:#a33}input{background:#111;color:#eee;border:1px solid #555;border-radius:8px;padding:8px}label{display:block;margin:8px 0}.big{font-size:1.6rem;font-weight:700}.muted{color:#aaa}.events{display:flex;flex-direction:column;gap:8px}.event{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #333;padding:7px 0}.pad{display:grid;grid-template-columns:repeat(3,52px);gap:7px;justify-content:center}.pad button{padding:12px 0}.ok{color:#74d67a}.err{color:#ff7b72}</style>
+</head><body>
+<h1>PiKVM HID Automation</h1><p class="muted">HID-Flow, Automatik, Zeitplanung und manuelle Steuerung</p>
+<div class="grid">
+<section class="card"><h2>Status</h2><div id="status" class="big">Lade…</div><p id="flow"></p><p id="next"></p><p id="error" class="err"></p><div class="row"><button onclick="triggerFlow()">Flow jetzt starten</button><button class="alt" onclick="refresh()">Aktualisieren</button></div></section>
+<section class="card"><h2>Automatik</h2><label><input id="auto" type="checkbox"> Automatische Wiederholung</label><div class="row"><label>Minuten min.<br><input id="amin" type="number" min="1" value="25"></label><label>Minuten max.<br><input id="amax" type="number" min="1" value="35"></label></div><button onclick="saveAuto()">Speichern</button></section>
+<section class="card"><h2>Geplanter Ablauf</h2><label>Start ab<br><input id="start" type="datetime-local"></label><div class="row"><label>Bis<br><input id="until" type="time" value="17:30"></label><label>Events<br><input id="count" type="number" min="1" max="8" value="4"></label></div><div class="row"><label>Min. Abstand<br><input id="pmin" type="number" min="1" value="15"></label><label>Max. Abstand<br><input id="pmax" type="number" min="1" value="44"></label></div><div class="row"><button onclick="calculate()">Events berechnen</button><button class="alt" onclick="startPlan()">Plan starten</button><button class="danger" onclick="stopPlan()">Stoppen</button></div><div id="events" class="events"></div></section>
+<section class="card"><h2>Manuelle HID-Steuerung</h2><div class="pad"><span></span><button onclick="mouse(0,-20)">↑</button><span></span><button onclick="mouse(-20,0)">←</button><button onclick="clickMouse()">●</button><button onclick="mouse(20,0)">→</button><span></span><button onclick="mouse(0,20)">↓</button><span></span></div><br><div class="row"><button onclick="key('Enter')">Enter</button><button onclick="shortcut(['ControlLeft','AltLeft','KeyF'])">Ctrl+Alt+F</button></div></section>
+</div>
+<script>
+let state={}; let draftEvents=[];
+const $=id=>document.getElementById(id);
+async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const j=await r.json();if(!j.ok)throw new Error(j.error||'Fehler');return j.result||j}
+function fmt(ts){return ts?new Date(ts*1000).toLocaleString(): '—'}
+function setDefaultStart(){if(!$('start').value){const d=new Date();d.setMinutes(d.getMinutes()-d.getTimezoneOffset());$('start').value=d.toISOString().slice(0,16)}}
+async function refresh(){try{state=await api('/api/status');$('status').textContent=state.flowRunning?'Flow läuft':'Bereit';$('status').className='big '+(state.lastError?'err':'ok');$('flow').textContent='Zustand: '+state.flowState+' · Letzte Auslösung: '+(state.lastTrigger||'—');$('next').textContent='Nächste Auslösung: '+fmt(state.nextTriggerAt);$('error').textContent=state.lastError||'';$('auto').checked=state.auto;$('amin').value=state.autoMinMinutes;$('amax').value=state.autoMaxMinutes;$('until').value=state.plannerUntil;$('count').value=state.plannerEvents;$('pmin').value=state.plannerMinMinutes;$('pmax').value=state.plannerMaxMinutes;if(!draftEvents.length)renderEvents(state.schedules||[])}catch(e){$('error').textContent=e.message}}
+function renderEvents(events){$('events').innerHTML='';events.forEach(ts=>{const div=document.createElement('div');div.className='event';div.innerHTML=`<span>${fmt(ts)}</span><button class="danger">Löschen</button>`;div.querySelector('button').onclick=async()=>{draftEvents=(draftEvents.length?draftEvents:state.schedules).filter(x=>x!==ts);await api('/api/schedule/replace',{times:draftEvents});renderEvents(draftEvents)};$('events').appendChild(div)})}
+async function triggerFlow(){await api('/api/trigger',{});refresh()}
+async function saveAuto(){await api('/api/settings',{auto:$('auto').checked,autoMinMinutes:+$('amin').value,autoMaxMinutes:+$('amax').value});refresh()}
+async function calculate(){draftEvents=(await api('/api/planner/calculate',{startAt:$('start').value,until:$('until').value,events:+$('count').value,min:+$('pmin').value,max:+$('pmax').value})).events;await api('/api/schedule/replace',{times:draftEvents});renderEvents(draftEvents);refresh()}
+async function startPlan(){await api('/api/schedule/start',{when:$('start').value});draftEvents=[];refresh()}
+async function stopPlan(){await api('/api/schedule/stop',{});refresh()}
+async function mouse(dx,dy){await api('/api/mouse',{dx,dy})}async function clickMouse(){await api('/api/click',{})}async function key(k){await api('/api/key',{key:k})}async function shortcut(keys){await api('/api/shortcut',{keys})}
+setDefaultStart();refresh();setInterval(refresh,2000);
+</script></body></html>
