@@ -1,0 +1,6 @@
+name: HID Automation
+description: Automatisierte PiKVM HID-Abläufe und Zeitplanung
+icon: share/svg/led-gear.svg
+path: hid-automation
+daemon: hid-automation
+place: 15
