@@ -56,6 +56,17 @@ if ! id "$HID_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/bin/nologin "$HID_USER"
 fi
 
+# KVMD creates /run/kvmd/kvmd.sock as kvmd:kvmd with mode 0660. USC decides
+# whether a process is authenticated after it connects, but the Unix user must
+# first have filesystem permission to open the socket. Keep the socket private
+# and grant only our dedicated service user access through the kvmd group.
+if getent group kvmd >/dev/null 2>&1; then
+  usermod -a -G kvmd "$HID_USER"
+else
+  echo "Fehler: Unix-Gruppe 'kvmd' wurde nicht gefunden."
+  exit 1
+fi
+
 mkdir -p "$APP_DIR/web" /etc/kvmd/override.d "$EXTRA_DIR"
 install -m 0755 "$SRC_DIR/app.py" "$APP_DIR/app.py"
 install -m 0755 "$SRC_DIR/server.py" "$APP_DIR/server.py"
@@ -121,10 +132,14 @@ sleep 2
 if ! runuser -u "$HID_USER" -- curl --fail --silent --unix-socket /run/kvmd/kvmd.sock http://localhost/info >/dev/null; then
   echo
   echo "Fehler: Unix-Socket-Authentifizierung für $HID_USER funktioniert weiterhin nicht."
+  echo "Socket:"
+  ls -l /run/kvmd/kvmd.sock || true
+  echo "Benutzer/Gruppen:"
+  id "$HID_USER" || true
   echo "Effektive USC-Konfiguration:"
   kvmd -M | sed -n '/usc:/,+8p' || true
   echo
-  echo "Bitte diese Ausgabe zusammen mit /etc/kvmd/override.yaml prüfen."
+  echo "Bitte diese Ausgabe senden."
   exit 1
 fi
 
