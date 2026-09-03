@@ -18,6 +18,14 @@ RestartSec=3
 User=root
 Group=root
 
+# With explicit User=root under NoNewPrivileges=true, systemd does not grant
+# the process the legacy "euid=0 gets full bounding set" capability regrant,
+# so CAP_SETUID/CAP_SETGID would be missing from the effective set and every
+# runuser call into the hid-automation user fails with "cannot set user id:
+# Operation not permitted". Ambient capabilities restore exactly what runuser
+# needs without granting anything broader.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

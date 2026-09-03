@@ -144,7 +144,12 @@ if ! runuser -u "$HID_USER" -- curl --fail --silent --unix-socket /run/kvmd/kvmd
 fi
 
 kvmd-pstrun -- mkdir -p /var/lib/kvmd/pst/data/hid-automation
-systemctl enable --now hid-automation.service
+systemctl enable hid-automation.service
+# "enable --now" does not restart an already-running instance, so a re-run of
+# this installer (e.g. to pick up a unit file change) would silently keep the
+# old process alive with its original, possibly outdated exec-time state
+# (capabilities, environment, code). Always restart explicitly instead.
+systemctl restart hid-automation.service
 sleep 1
 
 if ! curl --fail --silent http://127.0.0.1:8081/api/status >/dev/null; then
