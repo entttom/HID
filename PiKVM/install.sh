@@ -158,7 +158,13 @@ systemctl restart kvmd-nginx
 ro
 trap - EXIT
 
-PIKVM_IP="$(hostname -I | awk '{print $1}')"
+# Some PiKVM images ship a hostname implementation without the GNU -I option.
+# Prefer iproute2 (already present on PiKVM) and fall back to the host name.
+PIKVM_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); if (a[1] !~ /^127\./) {print a[1]; exit}}')"
+if [[ -z "$PIKVM_IP" ]]; then
+  PIKVM_IP="$(hostname)"
+fi
+
 echo
 echo "PiKVM HID Automation wurde installiert."
 echo "Öffne die normale PiKVM-Weboberfläche und gehe zu KVM."
