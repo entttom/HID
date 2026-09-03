@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Production launcher for PiKVM HID Automation.
 
-Runs the web/scheduler process as root only so kvmd-pstrun can safely remount
+The HTTP service is intended to listen on loopback and to be exposed through
+PiKVM's authenticated nginx frontend. Optional HTTP Basic Auth is still
+available for deliberate direct/LAN exposure.
+
+The scheduler process runs as root only so kvmd-pstrun can safely remount
 persistent storage for short writes. KVMD HID calls themselves are deliberately
 executed as the unprivileged `hid-automation` Unix user and authenticated by
 KVMD Unix Socket Credentials (USC).
 """
 import base64
+import ipaddress
 import json
 import os
 import subprocess
@@ -47,10 +52,19 @@ def kvmd_post(_cls, route, params=None):
 app.KvmdClient._post = classmethod(kvmd_post)
 
 
+def is_loopback_host(host):
+    if host in {"localhost", "ip6-localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 class AuthHandler(app.Handler):
     def authenticated(self):
         if not AUTH_PASS:
-            return False
+            return True
         expected = "Basic " + base64.b64encode(f"{AUTH_USER}:{AUTH_PASS}".encode()).decode()
         return self.headers.get("Authorization", "") == expected
 
@@ -76,13 +90,20 @@ class AuthHandler(app.Handler):
 
 
 def main():
-    if not AUTH_PASS:
-        raise SystemExit("HID_AUTOMATION_PASSWORD is empty; refusing to start")
+    # Empty Basic-Auth credentials are safe only when the backend is reachable
+    # from the local PiKVM host. Nginx then provides the normal PiKVM login.
+    if not AUTH_PASS and not is_loopback_host(app.HOST):
+        raise SystemExit(
+            "HID_AUTOMATION_PASSWORD is empty while the service is not bound "
+            "to loopback; refusing to expose an unauthenticated HID endpoint"
+        )
+
     app.load_state()
     import threading
     threading.Thread(target=app.scheduler_loop, daemon=True, name="scheduler").start()
     server = ThreadingHTTPServer((app.HOST, app.PORT), AuthHandler)
-    print(f"PiKVM HID Automation läuft auf http://{app.HOST}:{app.PORT}")
+    mode = "PiKVM nginx auth" if not AUTH_PASS else "HTTP Basic Auth"
+    print(f"PiKVM HID Automation läuft auf http://{app.HOST}:{app.PORT} ({mode})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
