@@ -1,0 +1,32 @@
+[Unit]
+Description=PiKVM HID Automation
+After=network-online.target kvmd.service
+Wants=network-online.target
+Requires=kvmd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hid-automation
+EnvironmentFile=/etc/hid-automation.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python /opt/hid-automation/server.py
+Restart=on-failure
+RestartSec=3
+
+# The launcher needs root only for short kvmd-pstrun persistent-storage writes.
+# HID requests are executed as the dedicated hid-automation user via runuser.
+User=root
+Group=root
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
