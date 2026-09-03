@@ -24,6 +24,11 @@ if ! command -v kvmd-pstrun >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v kvmd-override >/dev/null 2>&1; then
+  echo "Fehler: kvmd-override wurde nicht gefunden. Bitte PiKVM aktualisieren."
+  exit 1
+fi
+
 if ! command -v nginx >/dev/null 2>&1; then
   echo "Fehler: nginx wurde nicht gefunden."
   exit 1
@@ -71,15 +76,30 @@ HID_AUTOMATION_KVMD_USER=$HID_USER
 EOF
 chmod 0600 "$ENV_FILE"
 
-# Dedicated Unix Socket Credentials identity for local KVMD API access.
-# If another custom USC users-list exists in a later override file, that list
-# must also contain hid-automation.
+# Keep an atomic vendor-style override as a baseline.
 cat > "$USC_FILE" <<EOF
 kvmd:
     auth:
         usc:
             users: [$HID_USER]
 EOF
+
+# PiKVM loads override.yaml AFTER override.d. If override.yaml already contains
+# kvmd/auth/usc/users, it replaces the list from our fragment. Read the effective
+# list, preserve all existing users, add hid-automation, and write that final
+# list through the official kvmd-override helper into override.yaml.
+USC_USERS_JSON="$(kvmd -M | python -c '
+import json, sys, yaml
+user = sys.argv[1]
+data = yaml.safe_load(sys.stdin) or {}
+users = (((data.get("kvmd") or {}).get("auth") or {}).get("usc") or {}).get("users") or []
+users = [str(x) for x in users]
+if user not in users:
+    users.append(user)
+print(json.dumps(users, separators=(",", ":")))
+' "$HID_USER")"
+
+kvmd-override --set "kvmd/auth/usc/users=$USC_USERS_JSON"
 
 # Validate KVMD config before restarting it.
 kvmd -M >/dev/null
@@ -100,9 +120,11 @@ sleep 2
 
 if ! runuser -u "$HID_USER" -- curl --fail --silent --unix-socket /run/kvmd/kvmd.sock http://localhost/info >/dev/null; then
   echo
-  echo "Fehler: Unix-Socket-Authentifizierung für $HID_USER funktioniert nicht."
-  echo "Prüfe, ob kvmd/auth/usc/users in einer später geladenen Override-Datei überschrieben wird."
-  echo "Füge dort $HID_USER zur bestehenden users-Liste hinzu und starte kvmd neu."
+  echo "Fehler: Unix-Socket-Authentifizierung für $HID_USER funktioniert weiterhin nicht."
+  echo "Effektive USC-Konfiguration:"
+  kvmd -M | sed -n '/usc:/,+8p' || true
+  echo
+  echo "Bitte diese Ausgabe zusammen mit /etc/kvmd/override.yaml prüfen."
   exit 1
 fi
 
