@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import shlex
 import subprocess
 import threading
 import time
@@ -21,6 +22,11 @@ DEFAULT_STATE = {
     "auto": False,
     "autoMinMinutes": 25,
     "autoMaxMinutes": 35,
+    # Absolute HID coordinates (-32768..32767) for the flow's click step. If
+    # either is null, the click happens at whatever position the cursor is
+    # already at (previous default behavior) instead of moving first.
+    "clickX": None,
+    "clickY": None,
     "nextAutoAt": None,
     "plannerUntil": "17:30",
     "plannerMinMinutes": 15,
@@ -60,30 +66,47 @@ def parse_local_datetime(value):
     return int(dt.timestamp())
 
 
+persist_lock = threading.Lock()
+
+
 def persist_state():
     with lock:
         payload = json.dumps(state, ensure_ascii=False, indent=2)
-    try:
-        subprocess.run(
-            ["kvmd-pstrun", "--", "mkdir", "-p", str(STATE_DIR)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        proc = subprocess.run(
-            ["kvmd-pstrun", "--", "tee", str(STATE_FILE)],
-            input=payload,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        return True
-    except Exception as exc:
-        with lock:
-            state["lastError"] = f"Persistenz fehlgeschlagen: {exc}"
-        return False
+    # kvmd-pst only keeps the storage writable for the lifetime of a single
+    # kvmd-pstrun session (it remounts back to ro as soon as the session
+    # closes). A single shell handles mkdir+write within one session/mount
+    # cycle instead of two separate kvmd-pstrun calls, halving round trips.
+    cmd = f"mkdir -p {shlex.quote(str(STATE_DIR))} && cat > {shlex.quote(str(STATE_FILE))}"
+    last_exc = None
+    # persist_lock serializes calls from different threads (HTTP handlers vs
+    # the scheduler loop) so this process never has two kvmd-pstrun sessions
+    # racing each other. Even so, kvmd-pstrun occasionally still reports
+    # "PST write is allowed" and then hits "Read-only file system" on the
+    # actual write - observed even from a plain interactive shell, so it's a
+    # timing quirk in kvmd-pst's own session/remount handling, not something
+    # under our control. Retry a couple of times before giving up.
+    with persist_lock:
+        for attempt in range(3):
+            try:
+                subprocess.run(
+                    ["kvmd-pstrun", "--", "sh", "-c", cmd],
+                    input=payload,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                with lock:
+                    if (state["lastError"] or "").startswith("Persistenz fehlgeschlagen"):
+                        state["lastError"] = None
+                return True
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(0.5)
+    with lock:
+        state["lastError"] = f"Persistenz fehlgeschlagen: {last_exc}"
+    return False
 
 
 def load_state():
@@ -128,6 +151,15 @@ class KvmdClient:
         cls._post("/hid/events/send_mouse_button", {"button": "left"})
 
     @classmethod
+    def move(cls, x, y):
+        cls._post("/hid/events/send_mouse_move", {"to_x": int(x), "to_y": int(y)})
+
+    @classmethod
+    def click_at(cls, x, y):
+        cls.move(x, y)
+        cls.click()
+
+    @classmethod
     def key(cls, key):
         cls._post("/hid/events/send_key", {"key": key})
 
@@ -145,6 +177,15 @@ def set_flow_state(value):
         state["flowState"] = value
 
 
+def perform_click_step():
+    with lock:
+        x, y = state.get("clickX"), state.get("clickY")
+    if x is not None and y is not None:
+        KvmdClient.click_at(x, y)
+    else:
+        KvmdClient.click()
+
+
 def perform_flow(source="manual"):
     with lock:
         if state["flowRunning"]:
@@ -157,7 +198,7 @@ def perform_flow(source="manual"):
 
     try:
         set_flow_state("click")
-        KvmdClient.click()
+        perform_click_step()
         time.sleep(5)
         set_flow_state("enter")
         KvmdClient.key("Enter")
@@ -178,7 +219,7 @@ def perform_flow(source="manual"):
 
 
 def perform_pre_event():
-    KvmdClient.click()
+    perform_click_step()
     time.sleep(5)
     KvmdClient.key("Enter")
 
@@ -425,6 +466,10 @@ class Handler(BaseHTTPRequestHandler):
                     if "auto" in body: state["auto"] = bool(body["auto"])
                     if "autoMinMinutes" in body: state["autoMinMinutes"] = int(body["autoMinMinutes"])
                     if "autoMaxMinutes" in body: state["autoMaxMinutes"] = int(body["autoMaxMinutes"])
+                    if "clickX" in body:
+                        state["clickX"] = None if body["clickX"] is None else int(body["clickX"])
+                    if "clickY" in body:
+                        state["clickY"] = None if body["clickY"] is None else int(body["clickY"])
                     if not state["auto"]:
                         state["nextAutoAt"] = None
                     elif not state.get("nextAutoAt"):

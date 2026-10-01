@@ -5,7 +5,10 @@ PiKVM-Variante des ESP32-HID-Projekts. Die Automatisierung läuft direkt auf dem
 ## Funktionen
 
 - eigener Automationsdienst mit mobilfreundlicher Weboberfläche
-- zusätzlicher **Automation**-Eintrag direkt in der KVM-Navigationsleiste neben Macro/Text
+- zusätzlicher **Automation**-Eintrag direkt in der KVM-Navigationsleiste neben Macro/Text, öffnet ein Modal inline in `/kvm/`
+- Mouse-Jiggler-Umschalter im Modal, der PiKVMs eigenen nativen Jiggler steuert
+- optionale fixe Klick-Position (absolute HID-Koordinaten) für den Klick-Schritt in Flow und geplantem Ablauf
+- Live-Anzeige der Mausposition (Pixel + absolute HID-Koordinaten) in PiKVMs nativem Mouse-Fenster
 - zusätzlicher **HID Automation**-Eintrag auf der PiKVM-Startseite über das Extras-System
 - Zugriff über denselben HTTPS-Endpunkt und dieselbe Anmeldung wie PiKVM
 - Backend lauscht nur lokal auf `127.0.0.1:8081`; Port 8081 wird nicht ins LAN veröffentlicht
@@ -132,13 +135,19 @@ systemctl status kvmd-nginx
 
 ## Webinterface
 
-Bereiche:
+Zwei Oberflächen, gleiches Backend:
 
-- **Status** – aktueller Flow, letzte und nächste Auslösung, Fehler
+**Modal direkt in `/kvm/`** (Klick auf **Automation** in der Navbar öffnet es inline, ohne die Seite zu verlassen; Strg/Cmd/Mittelklick öffnet stattdessen die volle Seite in einem neuen Tab):
+
+- **Status** – aktueller Flow, letzte/nächste Auslösung, Fehler, "Flow jetzt starten"
+- **Mouse Jiggler** – schaltet PiKVMs eigenen, nativen Jiggler direkt um (kein Duplikat, siehe Abschnitt weiter unten)
 - **Automatik** – ein/aus und zufälliges Min-/Max-Intervall
-- **Geplanter Ablauf** – Startzeit, Endzeit, Eventanzahl, Min-/Max-Abstand, berechnete Eventliste
-- **Manuelle HID-Steuerung** – Maus, Klick, Enter und `Ctrl+Alt+F`
-- **← KVM** – zurück zur normalen PiKVM-KVM-Ansicht
+- **Klick-Position (fix)** – optionale absolute HID-Koordinaten für den Klick-Schritt in Flow und geplantem Ablauf. Leer = Klick an der aktuellen Mausposition (Standard). Ein Button übernimmt die zuletzt im PiKVM-Mouse-Fenster abgelesene Position (siehe unten) direkt ins Formular.
+- **Geplanter Ablauf** – Startzeit, Endzeit, Eventanzahl, Min-/Max-Abstand, Status (aktiv/inaktiv samt Startzeit), berechnete/aktive Eventliste mit Lösch-Möglichkeit pro Event
+
+**Volle Seite** unter `https://PIKVM-IP/hid-automation/` – dieselben Bereiche plus zusätzlich eine **manuelle HID-Steuerung** (Maus-Pad, Klick, Enter, `Ctrl+Alt+F`), gedacht für Mobilgeräte oder wenn man die Oberfläche ohne offene KVM-Sitzung aufrufen will.
+
+Außerdem zeigt PiKVMs natives **Mouse**-Fenster (in `/kvm/`) jetzt live die Mausposition über dem Video-Stream an: `Pixel: x, y · Absolut: x, y`. PiKVM berechnet die absolute HID-Position intern zwar bereits, zeigt sie aber nirgends an – das holt dieses Projekt rein per JavaScript nach, ohne PiKVMs Dateien zu verändern. Nützlich u.a. um die Koordinaten für "Klick-Position (fix)" abzulesen. Funktioniert zuverlässig im MJPEG-Stream-Modus; bei WebRTC/Janus kann die Anzeige stehen bleiben.
 
 ## API
 
@@ -169,6 +178,16 @@ POST /hid-automation/api/settings
   "auto": true,
   "autoMinMinutes": 25,
   "autoMaxMinutes": 35
+}
+```
+
+Fixe Klick-Position setzen (absolute HID-Koordinaten, -32768 bis 32767; `null` setzt auf "aktuelle Mausposition" zurück):
+
+```http
+POST /hid-automation/api/settings
+{
+  "clickX": -2887,
+  "clickY": -14950
 }
 ```
 

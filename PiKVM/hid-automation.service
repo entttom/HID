@@ -26,12 +26,18 @@ Group=root
 # needs without granting anything broader.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 
+# PrivateTmp/ProtectHome/ProtectKernelTunables/ProtectKernelModules/
+# ProtectControlGroups each require systemd to give this unit its own mount
+# namespace. Once isolated that way, the dynamic "mount -o remount,rw" that
+# kvmd-pst performs on /var/lib/kvmd/pst for each kvmd-pstrun session never
+# becomes visible inside the unit's namespace: kvmd-pstrun reports "PST write
+# is allowed" but the actual write then fails with "Read-only file system",
+# so state persistence breaks silently. Verified empirically that any of
+# these directives alone is fine, but combining more than ~2 forces the
+# isolated-namespace path even for paths they don't otherwise touch - so
+# they're dropped entirely rather than kept as a fragile, undocumented-limit
+# partial set.
 NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
