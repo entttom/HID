@@ -13,6 +13,9 @@ SERVICE_FILE="/etc/systemd/system/hid-automation.service"
 USC_FILE="/etc/kvmd/override.d/9980-hid-automation.yaml"
 EXTRA_DIR="/usr/share/kvmd/extras/hid-automation"
 HID_USER="hid-automation"
+# Interval (seconds) of PiKVM's built-in mouse jiggler. PiKVM randomizes it by
+# +/-25 %, so 300 means a nudge after 225-375 s of inactivity.
+JIGGLER_INTERVAL="${JIGGLER_INTERVAL:-300}"
 
 if [[ ! -S /run/kvmd/kvmd.sock ]]; then
   echo "Fehler: /run/kvmd/kvmd.sock wurde nicht gefunden. Läuft dieses Script auf PiKVM?"
@@ -112,6 +115,10 @@ print(json.dumps(users, separators=(",", ":")))
 
 kvmd-override --set "kvmd/auth/usc/users=$USC_USERS_JSON"
 
+# Slow down the built-in PiKVM mouse jiggler (default: 60 s). It is only
+# switched on and put into relative mode in the PiKVM web UI, see README.
+kvmd-override --set "kvmd/hid/jiggler/interval=$JIGGLER_INTERVAL"
+
 # Validate KVMD config before restarting it.
 kvmd -M >/dev/null
 
@@ -178,6 +185,10 @@ echo
 echo "Direkter Pfad über PiKVM: https://$PIKVM_IP/hid-automation/"
 echo "Die normale PiKVM-Anmeldung schützt Weboberfläche und API."
 echo "Port 8081 lauscht nur auf 127.0.0.1 und ist nicht im LAN erreichbar."
+echo
+echo "Mouse Jiggler: Intervall auf ${JIGGLER_INTERVAL}s gesetzt (±25 %)."
+echo "Im PiKVM-Webinterface noch den Mouse-Modus auf Relative stellen und"
+echo "den Mouse Jiggler einschalten (siehe README, Abschnitt Mouse Jiggler)."
 echo
 echo "Status: systemctl status hid-automation"
 echo "Logs:   journalctl -u hid-automation -f"

@@ -263,6 +263,29 @@ Damit werden keine Zugangsdaten für die normale PiKVM-Weboberfläche benötigt.
 
 Für das reine Wachhalten des Zielsystems kann der bereits in PiKVM vorhandene Mouse Jiggler verwendet werden. Dadurch muss diese Funktion nicht doppelt in der Automatisierung laufen. Der eigentliche Flow und der Zeitplaner dieses Projekts funktionieren unabhängig davon.
 
+### Empfohlene Einstellung
+
+`install.sh` setzt das Jiggler-Intervall auf **300 Sekunden** (`kvmd/hid/jiggler/interval`). PiKVM streut das Intervall selbst um ±25 %, der Jiggler bewegt die Maus also nach 225–375 Sekunden Inaktivität. Eingaben dieser Automation (Klick, Enter, `Ctrl+Alt+F`) zählen als Aktivität und verschieben den nächsten Jiggle.
+
+Ein anderes Intervall (in Sekunden) lässt sich beim Installieren mitgeben:
+
+```bash
+JIGGLER_INTERVAL=180 ./install.sh
+```
+
+Danach im PiKVM-Webinterface:
+
+1. **Mouse-Modus auf Relative** stellen.
+2. **Mouse Jiggler** einschalten.
+
+Der Mouse-Modus ist wichtig. Im Absolute-Modus sendet der Jiggler absolute Koordinaten rund um die zuletzt in KVMD bekannte Zeigerposition (nach einem Neustart die Mitte des Koordinatenraums). Ein absoluter HID-Zeiger wird auf dem Zielsystem typischerweise nur auf den Hauptbildschirm abgebildet. Bei mehreren Monitoren springt der Zeiger deshalb alle paar Minuten auf den ersten Bildschirm zurück. Das stört auch den Flow, weil der Linksklick dort landet, wo der Zeiger gerade steht. Im Relative-Modus bewegt der Jiggler die Maus nur um ±10 px hin und zurück, und der Zeiger bleibt auf seinem Bildschirm.
+
+Die Schrittweite des Jigglers (±10 px im Relative-Modus) ist in PiKVM fest eingebaut und nicht konfigurierbar. Den aktuellen Zustand zeigt:
+
+```bash
+runuser -u hid-automation -- curl -s --unix-socket /run/kvmd/kvmd.sock http://localhost/hid
+```
+
 ## Dateien
 
 ```text
